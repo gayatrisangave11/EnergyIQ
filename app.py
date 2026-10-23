@@ -27,13 +27,21 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.io as pio
 from sklearn.ensemble import IsolationForest
 
 
 load_dotenv()
 
-st.set_page_config(page_title="EnergyIQ — Smart Energy Consumption Optimizer",
-                   page_icon="⚡", layout="wide")
+st.set_page_config(page_title="EnergyIQ | Smart Energy Insights", page_icon="⚡", layout="wide")
+pio.templates["energyiq"] = go.layout.Template(layout=go.Layout(
+    colorway=["#527FA3", "#C8755D", "#E8DCC8"],
+    paper_bgcolor="#FAF7F0", plot_bgcolor="#FAF7F0",
+    font=dict(color="#293743"),
+    xaxis=dict(gridcolor="#E8DCC8", zerolinecolor="#E8DCC8"),
+    yaxis=dict(gridcolor="#E8DCC8", zerolinecolor="#E8DCC8")
+))
+pio.templates.default = "energyiq"
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -361,7 +369,7 @@ def clean_dataset(raw, cfg):
         s = work[n] * factor
         info["unit_out"] = {"Power": "kW", "Unknown": "unknown"}.get(mt, "kWh")
         if mt == "Cumulative meter reading":
-            work[n + "__reading"] = work[n]
+            work[n + "__reading"] = s
             d = s.groupby(by_meter).diff() if has_meter else s.diff()
             resets = d < 0                      # never treated as consumption
             info["resets"] = int(resets.sum())
@@ -370,6 +378,7 @@ def clean_dataset(raw, cfg):
             info["spans_gap"] = int(spans.sum())
             d[spans] = np.nan
             work[n + "__reset"] = resets
+            # Store the interval consumption, in canonical kWh, as the energy column.
             s = d
             info["energy_col"] = n
             if info["resets"]:
@@ -981,28 +990,28 @@ def build_timeline(item, res, show_ml, show_peaks, show_anom):
     d = plot["display"]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=d["timestamp"], y=d["value"], mode="lines+markers" if len(d) <= 1500 else "lines",
-                             name=det["label"], line=dict(width=1.5, color="#1f77b4"), marker=dict(size=3),
+                             name=det["label"], line=dict(width=2, color="#527FA3"), marker=dict(size=3),
                              connectgaps=False, hovertemplate=f"%{{x}}<br>%{{y:.4g}} {unit}<extra></extra>"))
     if show_peaks and item["thr"] is not None:
         runs = plot["runs"]
         label = f"Statistical peak (>= P{res['pct']:g}, relative to this data)"
         if runs is not None and len(runs) <= MAX_SHAPES:
             fig.update_layout(shapes=[dict(type="rect", xref="x", yref="paper", x0=a.isoformat(), x1=b.isoformat(),
-                                           y0=0, y1=1, fillcolor="rgba(128,128,128,0.25)", line_width=0, layer="below")
+                                           y0=0, y1=1, fillcolor="rgba(200,117,93,0.18)", line_width=0, layer="below")
                                       for a, b in runs])
             fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name=label,
-                                     marker=dict(symbol="square", size=12, color="rgba(128,128,128,0.4)")))
+                                     marker=dict(symbol="square", size=12, color="rgba(200,117,93,0.35)")))
         else:
             p = frame[frame["statistical_peak"]]
             fig.add_trace(go.Scatter(x=p["timestamp"], y=p["value"], mode="markers", name=label + " (markers)",
-                                     marker=dict(size=5, color="rgba(90,90,90,0.7)"), hovertemplate=f"%{{x}}<br>%{{y:.4g}} {unit}<extra>peak</extra>"))
+                                     marker=dict(size=5, color="#C8755D"), hovertemplate=f"%{{x}}<br>%{{y:.4g}} {unit}<extra>peak</extra>"))
         fig.add_trace(go.Scatter(x=[frame["timestamp"].min(), frame["timestamp"].max()], y=[item["thr"]] * 2, mode="lines",
                                  name=f"P{res['pct']:g} threshold ({item['thr']:.4g} {unit})".replace(" )", ")"),
-                                 line=dict(color="gray", dash="dash", width=1)))
+                                 line=dict(color="#527FA3", dash="dash", width=1)))
     if show_anom and show_ml and item["ml"]:
         a = frame[frame["ml_anomaly"]]
-        for both, name, symbol, edge in [(False, "ML anomaly", "circle", "white"),
-                                         (True, "ML anomaly + statistical peak", "diamond", "black")]:
+        for both, name, symbol, edge in [(False, "ML anomaly", "circle", "#F3EBDD"),
+                                         (True, "ML anomaly + statistical peak", "diamond", "#F3EBDD")]:
             s = a[a["statistical_peak"] == both]
             if s.empty:
                 continue
@@ -1011,7 +1020,7 @@ def build_timeline(item, res, show_ml, show_peaks, show_anom):
                      + f"Anomaly score: {r['anomaly_score']:.3f}<br>{r['day_of_week']} {int(r['hour']):02d}:00"
                      for _, r in s.iterrows()]
             fig.add_trace(go.Scatter(x=s["timestamp"], y=s["value"], mode="markers", name=name, hovertext=hover,
-                                     hoverinfo="text", marker=dict(color="red", size=10, symbol=symbol, line=dict(width=1.5, color=edge))))
+                                     hoverinfo="text", marker=dict(color="#C8755D", size=10, symbol=symbol, line=dict(width=1.5, color=edge))))
     fig.update_layout(height=480, hovermode="closest", margin=dict(l=10, r=10, t=30, b=10),
                       xaxis=dict(title="Time", rangeslider=dict(visible=True)),
                       yaxis=dict(title=det["label"]),
@@ -1024,7 +1033,7 @@ def build_heatmap(item, res):
     unit = res["info"]["unit_out"] if res["info"]["unit_out"] != "unknown" else "unknown unit"
     fig = go.Figure(go.Heatmap(
         z=h["z"].to_numpy(dtype=float), x=[f"{i:02d}:00" for i in range(24)], y=DAY_NAMES,
-        customdata=h["n"].to_numpy(), colorscale="RdBu_r", hoverongaps=False,
+        customdata=h["n"].to_numpy(), colorscale=[[0.0, "#6F9BB8"], [0.5, "#F3EBDD"], [1.0, "#C8755D"]], hoverongaps=False,
         colorbar=dict(title=f"Mean<br>{unit}"),
         hovertemplate=f"%{{y}} %{{x}}<br>Mean: %{{z:.4g}} {unit}<br>Valid observations: %{{customdata}}<extra></extra>"))
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
@@ -1313,7 +1322,7 @@ def render_green_sync(kp, total_kwh):
     st.caption("Both factors are placeholders unless you enter verified values (e.g. from your supplier or national grid data).")
     fig = go.Figure(go.Indicator(mode="gauge+number", value=share, number=dict(suffix="%"),
                                  title=dict(text="Assumed renewable share (simulated scenario)"),
-                                 gauge=dict(axis=dict(range=[0, 100]), bar=dict(color="seagreen"))))
+                                 gauge=dict(axis=dict(range=[0, 100]), bar=dict(color="#527FA3"))))
     fig.update_layout(height=280, margin=dict(l=20, r=20, t=60, b=10))
     st.plotly_chart(fig, key=kp("gs_fig"))
     green = {"simulated_scenario_only": True, "assumed_renewable_share_pct": share,
@@ -1334,7 +1343,7 @@ def render_green_sync(kp, total_kwh):
     st.caption("The comparison is between two assumed supply mixes for the same energy use. It is not carbon actually avoided.")
 
 
-def render_simulator(item, res, kp):
+def render_simulator(item, res, kp, include_green_sync=True):
     """Block 4 simulator. Stores its results under 'block4_summary' for the Block 5 report."""
     det, frame = item["det"], item["frame"]
     st.subheader("Energy Shifting & ROI Simulator")
@@ -1351,19 +1360,21 @@ def render_simulator(item, res, kp):
     if reason:
         st.warning(reason)
         st.session_state["block4_summary"] = {"available": False, "reason": reason}
-        render_green_sync(kp, None)
+        if include_green_sync:
+            render_green_sync(kp, None)
         return
     c1, c2, c3 = st.columns(3)
     shift = c1.slider("Shift Heavy Operations (Hours)", 0, 6, 0, key=kp("sim_shift"),
                       help="Moves the chosen share of expensive-period energy this many hours later. 0 = no change.")
     pct = c2.slider("Shiftable Energy Fraction (%)", 0, 100, 25, 5, key=kp("sim_frac"),
                     help="Assumption: the share of energy in expensive periods that could be moved. It is not measured.")
-    cur = c3.text_input("Currency label", "INR", key=kp("sim_cur")).strip() or "INR"
+    cur = "INR"
+    c3.metric("Currency", "₹ INR")
     neg = st.checkbox("Allow negative prices (advanced scenario)", key=kp("sim_neg"))
     lo = -100.0 if neg else 0.0
     p1, p2 = st.columns(2)
-    base_price = p1.number_input(f"Baseline electricity cost ({cur}/kWh)", lo, 100.0, 7.00, 0.50, key=kp("sim_bp"))
-    peak_price = p2.number_input(f"Peak (expensive-period) electricity cost ({cur}/kWh)", lo, 100.0, 11.00, 0.50, key=kp("sim_pp"))
+    base_price = p1.number_input(f"Baseline electricity cost (₹/kWh)", lo, 100.0, 8.00, 0.50, key=kp("sim_bp_inr"))
+    peak_price = p2.number_input(f"Peak (expensive-period) electricity cost (₹/kWh)", lo, 100.0, 12.00, 0.50, key=kp("sim_pp_inr"))
     st.caption("Default prices are illustrative placeholders, not your local tariff. Totals are gross energy-cost estimates, not bills: "
                "taxes, demand charges and fixed charges are not modelled.")
     mode = st.radio("Which periods are expensive?", [MODE_ILLUS, MODE_TARIFF, MODE_STAT], key=kp("sim_mode"))
@@ -1395,7 +1406,8 @@ def render_simulator(item, res, kp):
         for x in errs:
             st.error(x)
         st.session_state["block4_summary"] = {"available": False, "reason": "The scenario settings are invalid: " + " ".join(errs)}
-        render_green_sync(kp, None)
+        if include_green_sync:
+            render_green_sync(kp, None)
         return
     if peak_price < base_price:
         st.warning("The expensive-period price is below the baseline price, so shifting out of those periods will increase cost.")
@@ -1403,14 +1415,14 @@ def render_simulator(item, res, kp):
              MODE_STAT: "Scenario treating statistical peaks as expensive (not a tariff)"}[mode]
     exp = expensive_mask(frame, mode, days, start, end)
     r = simulate_shift(frame, exp, shift, pct / 100.0, base_price, peak_price, ef_exp, ef_oth)
-    money = lambda x: f"{cur} {x:,.2f}"
+    money = lambda x: f"₹{x:,.2f}"
     st.markdown(f"**Result: simulated estimate. {label}.**")
     if r["n_exp_valid"] == 0:
         st.warning("No valid hours fall in the expensive periods, so there is nothing to shift.")
     m = st.columns(4)
     m[0].metric("Baseline energy cost (est.)", money(r["cost_base"]))
     m[1].metric("Simulated cost after shift (est.)", money(r["cost_sim"]))
-    m[2].metric("Estimated saving (baseline - simulated)", f"{r['saving'] + 0.0:+,.2f} {cur}", help="Negative means the scenario costs more.")
+    m[2].metric("Estimated saving (baseline - simulated)", f"₹{r['saving'] + 0.0:+,.2f}", help="Negative means the scenario costs more.")
     m[3].metric("Change in cost", f"{-r['saving_pct'] + 0.0:+.2f}%" if r["saving_pct"] is not None else "n/a")
     m = st.columns(4)
     m[0].metric("Energy in expensive periods (kWh)", fmt(r["eligible_kwh"]))
@@ -1473,7 +1485,8 @@ def render_simulator(item, res, kp):
                    "avoided_by_less_energy_kg_co2e": r["co2_energy_diff"],
                    "note": "Illustrative: depends on user-assumed factors; shifting does not reduce total energy."},
         "note": "Gross energy-cost estimate under the stated assumptions; not a bill and not a guaranteed saving."}
-    render_green_sync(kp, r["energy_sim"])
+    if include_green_sync:
+        render_green_sync(kp, r["energy_sim"])
 
 
 # ----------------------------------------------------------------------------
@@ -1497,7 +1510,7 @@ RULES
    [Hypothesis] a possible explanation that still has to be tested.
 4. Never claim that a particular appliance or piece of equipment caused a spike. Never say an anomaly proves equipment failure. Never call a statistical peak an expensive or tariff period unless the evidence says the user confirmed a tariff window. Never promise a specific monetary saving; simulated figures may only be quoted as scenario estimates under their stated assumptions. Never claim actual carbon reduction from the simulated renewable-share dial or from placeholder emission factors. Never treat missing readings as zero consumption.
 5. If the evidence does not establish a cause, recommend an investigation instead of asserting one. If a metric is listed as unavailable, say so and do not estimate it. If data coverage or quality is limited, make one of the steps about improving measurement or resolving the data-quality issue.
-6. Be concise, professional and understandable to a non-expert. Each field is one to three sentences.
+6. Prioritise device/appliance/meter-specific findings when the evidence contains device_comparison: name the highest-use device(s), cite measured totals or peak/anomaly counts, and suggest a targeted check for those device(s). If device-level identifiers are absent, explicitly say the data only supports whole-meter conclusions and recommend collecting submeter/appliance readings; do not invent appliance names. Generic advice such as “analyse readings” is insufficient when device-level evidence exists. Be concise, professional and understandable to a non-expert. Each field is one to three sentences.
 
 OUTPUT FORMAT (follow exactly, in Markdown)
 Return exactly three numbered mitigation steps, numbered 1, 2 and 3, and nothing before step 1. Use this layout:
@@ -1613,6 +1626,30 @@ def build_evidence(item, res, show_ml, rep, cfg):
                    "highest_peaks": [{"timestamp": str(r.timestamp), "value": num(r.value)} for r in top.itertuples()],
                    "note": "Statistical peaks are relative to this dataset only. They are not tariff periods."})
     ev["statistical_peaks"] = sp
+
+    # Include per-meter evidence when each meter is separately represented in the analysis.
+    device_rows = []
+    for series_item in res.get("series", []):
+        try:
+            meter_name = series_item.get("meter")
+            sm = series_item.get("summary", {})
+            if meter_name is not None:
+                device_rows.append({
+                    "appliance_or_meter": clean_text(meter_name),
+                    "total_energy_kwh": num(sm.get("total_energy")),
+                    "mean_reading": num(sm.get("mean")),
+                    "peak_reading": num(sm.get("max")),
+                    "peak_count": int(sm.get("n_peaks", 0)),
+                    "valid_points": int(sm.get("n_valid", 0)),
+                })
+        except Exception:
+            continue
+    if device_rows:
+        ev["device_comparison"] = sorted(
+            device_rows,
+            key=lambda x: x["total_energy_kwh"] if x["total_energy_kwh"] is not None else -1,
+            reverse=True
+        )[:10]
 
     # anomalies
     an = {"method": "IsolationForest", "contamination_setting": item["ml"]["contamination"] if item["ml"] else None}
@@ -1763,273 +1800,505 @@ def call_groq(evidence_json, api_key, model):
 
 
 def render_report_section(result, ctx):
-    """Block 5 UI. ctx is a dict (item/res/show_ml) when analytics exist, otherwise a reason string."""
-    st.divider()
-    st.subheader("AI-Powered Executive Mitigation Plan")
-    st.markdown("This report sends a **compact summary of your current results** (not the raw CSV) to a Groq-hosted language model. "
-                "It covers: data coverage and quality, average and maximum consumption, statistical peaks, ML anomalies, potential "
-                "off-hours consumption against your schedule, the energy-shifting simulation, and the simulated carbon and Green Sync "
-                "assumptions. The model must return exactly **three evidence-based mitigation steps**. The report is advisory: "
-                "it separates observed facts, statistical indicators, simulated scenarios and hypotheses.")
+    """Compact, user-facing executive recommendations page."""
+    st.subheader("Recommendations")
+    st.write("Generate three evidence-based actions from the current analysis. The uploaded CSV itself is not sent to the language model; only a compact summary of analysis results is used.")
     evidence = None
     if isinstance(ctx, dict):
         try:
             evidence = build_evidence(ctx["item"], ctx["res"], ctx["show_ml"], result["report"], result["config"])
-        except Exception as exc:     # never let the report break the dashboard
-            st.error(f"The evidence summary could not be prepared ({type(exc).__name__}). The rest of EnergyIQ is unaffected.")
+        except Exception:
+            st.warning("The recommendation summary could not be prepared. Other dashboard features remain available.")
     else:
-        st.warning(ctx)
-
+        st.info(str(ctx))
+    if evidence is None:
+        st.info("Run the analysis first, then return here to generate recommendations.")
+        return
     level, checks = assess_evidence(evidence)
     if level == "Sufficient":
-        st.success("Evidence status: SUFFICIENT. The current dataset and settings provide validated information for a useful report.")
+        st.success("There is enough evidence for a useful report, subject to the assumptions shown in the dashboard.")
     elif level == "Limited":
-        st.warning("Evidence status: LIMITED. A report can be generated, but some information is missing or assumed (see below). "
-                   "The model is told to acknowledge these limits.")
+        st.warning("Some information is missing or assumed. The report will be asked to acknowledge these limits.")
     else:
-        st.error("Evidence status: INSUFFICIENT. Run the analysis on a scope with enough valid readings before relying on a report.")
-    if checks:
-        st.dataframe(pd.DataFrame([{"Check": c, "Met": "Yes" if ok else "No", "Detail": d} for c, ok, d in checks]), hide_index=True)
-
+        st.warning("Evidence is limited. Review the data coverage and analysis settings before relying on recommendations.")
     api_key = get_config_value("GROQ_API_KEY")
     model = get_config_value("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-    # st.caption(f"Groq API key: {'detected (value hidden)' if api_key else 'NOT configured'}  |  Model: {clean_text(model, 80)}"
-    #            f"{'' if get_config_value('GROQ_MODEL') else ' (default; set GROQ_MODEL to change)'}")
-    if not api_key:
-        with st.expander("How to configure the Groq API key", expanded=False):
-            st.markdown("1. Install the SDK: `pip install groq`\n"
-                        "2. Set the key as an environment variable before starting the app, e.g. `export GROQ_API_KEY=...` "
-                        "(Windows PowerShell: `$env:GROQ_API_KEY=\"...\"`), **or** put `GROQ_API_KEY = \"...\"` in `.streamlit/secrets.toml`.\n"
-                        "3. Optional: choose another model with `GROQ_MODEL` (see console.groq.com/docs/models).\n"
-                        "4. Restart the app. The rest of EnergyIQ works without a key.")
-
+    ev_json = json.dumps(evidence, separators=(",", ":"), default=str).replace("<", "\\u003c")
+    ev_sig = hashlib.md5(json.dumps(evidence, sort_keys=True, default=str).encode()).hexdigest()
     sig = st.session_state.get("cfg_sig", "")[:10]
-    ev_json, ev_sig = None, None
-    if evidence is not None:
-        ev_json = json.dumps(evidence, indent=1, default=str).replace("<", "\\u003c")
-        ev_sig = hashlib.md5(json.dumps(evidence, sort_keys=True, default=str).encode()).hexdigest()
-        # with st.expander("Evidence summary that will be sent to the model (no raw CSV, no API key)"):
-        #     st.code(ev_json, language="json")
-
-    c1, c2 = st.columns([1, 1])
-    clicked = c1.button("Generate Executive Report", type="primary", disabled=evidence is None, key=f"b5_gen_{sig}")
-    if c2.button("Check model availability", disabled=not api_key, key=f"b5_chk_{sig}"):
-        with st.spinner("Contacting Groq..."):
-            ok, msg = check_model(api_key, model)
-        (st.success if ok else st.error)(msg)
-
+    clicked = st.button("Generate recommendations", type="primary", disabled=not api_key, key=f"b5_gen_{sig}")
+    if not api_key:
+        st.info("AI recommendations are not configured on this installation. The dashboard analysis, heatmap and simulator still work.")
     if clicked:
         st.session_state.pop("block5_report", None)
-        if not api_key:
-            st.error("GROQ_API_KEY is not configured, so no report was generated. See the setup instructions above. "
-                     "No sample or placeholder report is shown.")
+        with st.spinner("Preparing recommendations…"):
+            text, err, raw = call_groq(ev_json, api_key, model)
+        if err:
+            st.error("Recommendations could not be generated. Please try again later or contact the app administrator.")
         else:
-            with st.spinner(f"Generating the executive report with {clean_text(model, 80)}..."):
-                text, err, raw = call_groq(ev_json, api_key, model)
-            if err:
-                st.error(err)
-                if raw:
-                    with st.expander("Unvalidated model output (not accepted as a report)"):
-                        st.text(raw[:6000])
-            else:
-                st.session_state["block5_report"] = {"sig": ev_sig, "text": text, "model": model,
-                                                     "at": datetime.now().strftime("%Y-%m-%d %H:%M")}
-                st.success("Report generated from the current dataset and settings.")
-
+            st.session_state["block5_report"] = {"sig": ev_sig, "text": text, "model": model,
+                                                  "at": datetime.now().strftime("%Y-%m-%d %H:%M")}
     saved = st.session_state.get("block5_report")
-    if saved and evidence is not None:
-        if saved["sig"] == ev_sig:
-            st.markdown("#### Recommendations")
-            st.markdown(saved["text"])
-            st.caption(f"Generated {saved['at']} by {clean_text(saved['model'], 80)}. AI-generated text can be wrong: check each "
-                       "claim against the figures above. Simulated figures are scenario estimates, not savings.")
-            st.download_button("Download report (Markdown)", saved["text"].encode("utf-8"),
-                               file_name="energyiq_executive_report.md", mime="text/markdown", key=f"b5_dl_{sig}")
-        else:
-            st.info("The data, scope or settings changed since the last report. Press 'Generate Executive Report' to create a new one.")
-    elif evidence is not None and not clicked:
-        st.info("No report yet. Press 'Generate Executive Report'.")
+    if saved and saved.get("sig") == ev_sig:
+        st.markdown("### Recommended actions")
+        st.markdown(saved["text"])
+        st.caption("AI-generated recommendations are advisory. Check each claim against the measured data; simulated savings are not guaranteed.")
+        st.download_button("Download recommendations", saved["text"].encode("utf-8"),
+                           file_name="energyiq_recommendations.md", mime="text/markdown", key=f"b5_dl_{sig}")
 
 
 # ----------------------------------------------------------------------------
-# Analytics section (Blocks 2-4) and report (Block 5)
+# User-facing dashboard: upload once, then use the sidebar to navigate.
 # ----------------------------------------------------------------------------
-def render_analytics_body(result):
-    """Blocks 2-4 UI. Returns a dict (item, res, show_ml) for the report, or a reason string."""
-    clean, rep = result["clean"], result["report"]
-    sig = st.session_state.get("cfg_sig", "")
-    k = lambda n: f"b2_{n}_{sig[:10]}"
-    for stale in ("block3_offhours", "block4_summary", "block4_green"):   # rebuilt below for this scope only
-        st.session_state.pop(stale, None)
-    st.subheader("8. Hourly analytics, statistical peaks and anomalies")
-    st.caption("Statistical peaks are values high relative to this dataset. They are not tariff periods, and high use is not "
-               "automatically waste. Anomalies are unusual value/time patterns found by a model. Neither proves a fault, "
-               "and neither identifies an appliance or a cause.")
-    names = list(rep["columns"])
-    c1, c2, c3 = st.columns(3)
-    name = c1.selectbox("Measurement to analyse", names, key=k("meas"))
-    info = rep["columns"][name]
-    meters = sorted(clean["meter"].unique().tolist()) if "meter" in clean.columns else []
-    ALL = "All meters (analysed separately)"
-    scope = c2.selectbox("Meter / zone scope", ([ALL] if len(meters) > 1 else []) + meters, key=k("scope")) if meters else None
-    if meters:
-        c2.caption("Meters are never combined here; each is analysed on its own.")
-    lo, hi = clean["timestamp"].min().date(), clean["timestamp"].max().date()
-    period = c3.date_input("Analysis period", (lo, hi), min_value=lo, max_value=hi, key=k("period"))
-    if not isinstance(period, tuple) or len(period) != 2:
-        st.info("Select both a start and an end date.")
-        return "Select both a start and an end date in the analysis period before generating a report."
-    d1, d2 = st.columns(2)
-    pct = d1.slider("Statistical peak percentile", 50.0, 99.5, 90.0, 0.5, key=k("pct"),
-                    help="Readings at or above this percentile of the selected scope are statistical peaks.")
-    cont = d2.slider("IsolationForest contamination", 0.01, 0.20, 0.05, 0.01, key=k("cont"),
-                     help="A model parameter: the expected share of outliers used to set the decision threshold. "
-                          "It is not a measured equipment-failure rate.")
-    if info["type"] == T_UNK:
-        st.warning(f"'{name}' has unknown type/unit. Peak and anomaly detection still work on relative values; "
-                   "energy totals, cost and carbon calculations are disabled.")
-    targets = ([None] if not meters else (meters if scope == ALL else [scope]))
-    base_sig = hashlib.md5(json.dumps([sig, name, [str(t) for t in targets], [str(p) for p in period], pct]).encode()).hexdigest()
-    ml_sig = hashlib.md5((base_sig + str(cont)).encode()).hexdigest()
-    b1, b2 = st.columns(2)
-    run_basic = b1.button("Run analysis (hourly + peaks)", key=k("run"))
-    run_ml = b2.button("Detect Anomalies", type="primary", key=k("ml"))
-    if run_basic or run_ml:
-        bar = st.progress(0.0, text="Starting...")
-        try:
-            res = run_analysis(clean, rep, name, targets, period, pct, cont, run_ml, bar, result["config"]["gap_factor"])
-            res.update({"base_sig": base_sig, "ml_sig": ml_sig if run_ml else None})
-            st.session_state["block2_results"] = res
-        except Exception as exc:
-            st.error(f"Analysis failed: {exc}")
-        bar.empty()
-    res = st.session_state.get("block2_results")
-    if not res or res.get("base_sig") != base_sig:
-        st.info("No analysis for the current dataset and settings yet. Press 'Run analysis' or 'Detect Anomalies'.")
-        return "No analysis exists yet for the current dataset and settings. Press 'Run analysis' or 'Detect Anomalies' above first."
-    show_ml = res.get("ml_sig") == ml_sig
-    if res["ran_ml"] and not show_ml:
-        st.info("The contamination setting changed. Press 'Detect Anomalies' to refresh the anomaly results.")
-    if not res["ran_ml"]:
-        st.info("Anomaly detection has not been run. Press 'Detect Anomalies'.")
-    labels = [("dataset" if i["meter"] is None else str(i["meter"])) for i in res["series"]]
-    if len(labels) > 1:
-        rows = [{"Meter / zone": lb, "Valid points": it["summary"]["n_valid"] if not it["error"] else 0,
-                 "Peaks": it["summary"]["n_peaks"] if not it["error"] else 0,
-                 "Anomalies": int(it["frame"]["ml_anomaly"].sum()) if (show_ml and not it["error"]) else None}
-                for lb, it in zip(labels, res["series"])]
-        st.dataframe(pd.DataFrame(rows).astype(str), hide_index=True)
-        pick = st.selectbox("Show details for", labels, key=k("pick"))
+
+def infer_quick_config(raw, timestamp_col=None, measurement_col=None, measurement_type=None, unit=None, meter_col=None):
+    """Build a sensible first-pass mapping while keeping units visible and editable."""
+    ts_suggestion = suggest_timestamp(raw)
+    if ts_suggestion and ts_suggestion.get("mode") == "single":
+        ts_col = timestamp_col or ts_suggestion["col"]
     else:
-        pick = labels[0]
-    item = res["series"][labels.index(pick)]
+        likely = [c for c in raw.columns if not pd.api.types.is_numeric_dtype(raw[c]) and parse_rate(raw[c]) >= 0.8]
+        ts_col = timestamp_col or (likely[0] if likely else raw.columns[0])
+    candidates = numeric_like_columns(raw, [ts_col])
+    scored, top = suggest_measurements(candidates)
+    meas_col = measurement_col or (top[0] if top else (candidates[0] if candidates else None))
+    if meas_col is None:
+        return None, "No numeric measurement column could be detected. Please upload a CSV with a timestamp and a numeric measurement."
+    nm = norm(meas_col)
+    if measurement_type:
+        mtype = measurement_type
+    elif any(x in nm for x in ("cumulative", "meter_reading", "total_reading", "register")):
+        mtype = "Cumulative meter reading"
+    elif any(x in nm for x in ("kw", "power", "watt", "demand")) and not any(x in nm for x in ("kwh", "energy")):
+        mtype = "Power"
+    elif any(x in nm for x in ("kwh", "mwh", "wh", "energy", "consumption", "consumed", "usage")):
+        mtype = "Energy per interval"
+    else:
+        mtype = "Energy per interval"
+    if unit:
+        selected_unit = unit
+    else:
+        selected_unit = next((u for u in ("MWh", "kWh", "Wh", "MW", "kW", "W") if re.search(r"(?<![a-z])" + u.lower() + r"(?![a-z])", nm)), None)
+        if selected_unit not in UNITS[mtype]:
+            selected_unit = {"Power": "kW", "Energy per interval": "kWh", "Cumulative meter reading": "kWh", "Unknown": "Unknown"}[mtype]
+    if mtype == "Unknown":
+        selected_unit = "Unknown"
+    sug_meter, _ = suggest_meter(raw, [ts_col, meas_col])
+    chosen_meter = meter_col if meter_col is not None else sug_meter
+    cfg = {"ts": {"mode": "single", "col": ts_col, "epoch": None},
+           "dayfirst": False, "tz_name": "Asia/Kolkata", "meas": [{"col": meas_col, "name": meas_col, "mtype": mtype, "unit": selected_unit}],
+           "meter_col": chosen_meter, "meters_selected": sorted(raw[chosen_meter].astype("string").str.strip().dropna().unique().tolist()) if chosen_meter else [],
+           "aggregate": False, "dup_policy": "Keep first", "gap_factor": 3.0, "decimal": ".",
+           "fill_policy": FILL_NONE, "fill_limit": 2}
+    return cfg, None
+
+
+def get_energy_total(clean, rep, name):
+    """Sum the valid kWh column generated by the existing cleaning pipeline."""
+    info = rep["columns"].get(name, {})
+    ecol = info.get("energy_col")
+    if not ecol or ecol not in clean.columns:
+        return None
+    vals = pd.to_numeric(clean[ecol], errors="coerce")
+    return float(vals.sum()) if vals.notna().any() else None
+
+
+def appliance_breakdown(clean, rep, selected_name):
+    """Summarise consumption and unusual readings by the dataset's meter/appliance identifier."""
+    if clean is None or "meter" not in clean.columns or clean["meter"].nunique(dropna=True) < 2:
+        return None
+    info = rep.get("columns", {}).get(selected_name, {})
+    energy_col = info.get("energy_col")
+    if not energy_col or energy_col not in clean.columns:
+        return None
+    frame = clean.copy()
+    frame[energy_col] = pd.to_numeric(frame[energy_col], errors="coerce")
+    frame[selected_name] = pd.to_numeric(frame[selected_name], errors="coerce")
+    rows = []
+    for meter, group in frame.groupby("meter", dropna=False, sort=False):
+        values = group[selected_name].dropna()
+        energy = group[energy_col].dropna()
+        if values.empty and energy.empty:
+            continue
+        # Robust per-device baseline: readings beyond Q3 + 1.5*IQR are flagged for review.
+        q1 = values.quantile(0.25) if len(values) >= 4 else None
+        q3 = values.quantile(0.75) if len(values) >= 4 else None
+        iqr = (q3 - q1) if q1 is not None and q3 is not None else None
+        threshold = (q3 + 1.5 * iqr) if iqr is not None and iqr > 0 else None
+        unusual = int((values > threshold).sum()) if threshold is not None else 0
+        rows.append({
+            "Appliance / meter": str(meter),
+            "Total energy (kWh)": float(energy.sum()) if not energy.empty else None,
+            "Mean reading": float(values.mean()) if not values.empty else None,
+            "Peak reading": float(values.max()) if not values.empty else None,
+            "Unusual high readings": unusual,
+            "Review threshold": float(threshold) if threshold is not None else None,
+            "Valid readings": int(values.size),
+        })
+    if not rows:
+        return None
+    result = pd.DataFrame(rows)
+    if "Total energy (kWh)" in result:
+        result = result.sort_values("Total energy (kWh)", ascending=False, na_position="last")
+    return result
+
+
+def render_appliance_insights(clean, rep, selected_name):
+    """Show device-level comparisons when the CSV contains an appliance/meter/zone identifier."""
+    st.markdown("### Appliance / meter-level insights")
+    if "meter" not in clean.columns or clean["meter"].nunique(dropna=True) < 2:
+        st.info("For appliance-level comparisons, map the optional meter/building/zone column to an appliance or device ID in your CSV. EnergyIQ cannot infer individual appliances from one aggregate building meter.")
+        return
+    table = appliance_breakdown(clean, rep, selected_name)
+    if table is None or table.empty:
+        st.info("Device-level energy totals are unavailable for this measurement type. Select an energy, cumulative-meter, or power measurement with a known unit.")
+        return
+    st.caption("Ranked by measured energy where available. 'Unusual high readings' use a per-device statistical threshold (Q3 + 1.5 × IQR); these are investigation flags, not proof of a fault.")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    energy_col = "Total energy (kWh)"
+    ranked = table.dropna(subset=[energy_col]) if energy_col in table else pd.DataFrame()
+    if not ranked.empty:
+        total = ranked[energy_col].sum()
+        top = ranked.iloc[0]
+        cols = st.columns(3)
+        cols[0].metric("Highest-use device", str(top["Appliance / meter"]))
+        cols[1].metric("Device energy", f"{top[energy_col]:,.2f} kWh")
+        share = 100 * top[energy_col] / total if total > 0 else None
+        cols[2].metric("Share of listed device energy", f"{share:.1f}%" if share is not None else "Unavailable")
+        st.markdown("**What to investigate first**")
+        flagged = table[table["Unusual high readings"] > 0]
+        if not flagged.empty:
+            st.write("Devices with unusual high readings: " + ", ".join(flagged["Appliance / meter"].astype(str).head(8).tolist()) + ". Compare the flagged timestamps with occupancy, operating schedules and equipment logs.")
+        else:
+            st.write("No device crossed the current per-device high-reading threshold. Compare the highest-use devices with their expected operating hours and rated power before deciding whether consumption is excessive.")
+
+
+def render_overview(result, ctx):
+    clean, rep = result["clean"], result["report"]
+    st.title("Energy overview")
+    st.caption("A quick view of the uploaded dataset. Cost is an illustrative estimate, not your utility bill.")
+    names = list(rep["columns"])
+    sig = st.session_state.get("cfg_sig", "")[:10]
+    key = f"overview_measure_{sig}"
+    if key not in st.session_state:
+        st.session_state[key] = names[0]
+    name = st.selectbox("Measurement", names, key=key)
+    info = rep["columns"][name]
+    energy = get_energy_total(clean, rep, name)
+    if energy is not None:
+        cost = energy * 8.0
+        unit_label = "kWh"
+        cost_label = f"₹{cost:,.0f}"
+        cost_help = "Estimated at an illustrative ₹8/kWh. Set your actual tariff in the simulator for a more relevant scenario."
+    else:
+        cost_label = "Unavailable"
+        cost_help = "A valid energy quantity in kWh is needed for a cost estimate. Check measurement type and unit."
+    duration = (clean["timestamp"].max() - clean["timestamp"].min())
+    metrics = st.columns(4)
+    source_unit = info.get("unit_in", "Unknown")
+    metrics[0].metric(
+        "Total energy",
+        f"{energy:,.2f} kWh" if energy is not None else "Unavailable",
+        help=f"Values are normalised to kWh for consistent analysis. Selected source unit: {source_unit}. "
+             "MWh inputs are converted to kWh (1 MWh = 1,000 kWh); power readings are converted to kW before interval energy is calculated."
+    )
+    metrics[1].metric("Estimated cost", cost_label, help=cost_help)
+    metrics[2].metric("Readings analysed", f"{len(clean):,}")
+    metrics[3].metric("Data span", str(duration).split(".")[0])
+    st.divider()
+    valid_share = 100 * (1 - rep["n_invalid_ts"] / max(rep["n_raw"], 1))
+    a, b, c = st.columns(3)
+    a.metric("Timestamp coverage", f"{valid_share:.1f}%", help="Share of original rows whose timestamps could be parsed; blank timestamps are counted separately in data quality.")
+    b.metric("Duplicate timestamps", f"{rep['n_dup']:,}")
+    c.metric("Detected data gaps", f"{rep['n_gaps']:,}")
+    render_appliance_insights(clean, rep, name)
+    st.divider()
+    st.markdown("### What to explore next")
+    cards = st.columns(3)
+    cards[0].markdown("**Heatmap & Ghost Load**\n\nFind recurring high-use hours and compare usage against operating hours.")
+    cards[1].markdown("**Peaks & anomalies**\n\nInspect unusually high readings and values that differ from typical patterns.")
+    cards[2].markdown("**Energy-shifting simulator**\n\nTest how shifting flexible demand could affect estimated electricity cost.")
+    st.info("Use the sidebar to open each analysis. High consumption or an anomaly is a prompt to investigate, not proof of waste or equipment failure.")
+    with st.expander("View consumption timeline"):
+        if isinstance(ctx, dict) and not ctx["item"]["error"]:
+            st.plotly_chart(build_timeline(ctx["item"], ctx["res"], ctx["show_ml"], True, True), use_container_width=True)
+        else:
+            st.info("The timeline will appear after the analysis completes.")
+
+
+def render_heatmap_page(item, res, kp):
+    st.title("Heatmap & Ghost Load")
+    st.write("Explore average usage by weekday and hour, then compare readings against your operating schedule.")
+    h = item["plot"]["heat"]
+    if h is None:
+        st.warning("There are not enough valid observations to build a heatmap.")
+        return
+    st.plotly_chart(build_heatmap(item, res), use_container_width=True, key=kp("heatmap_only"))
+    valid = h["z"].stack().dropna()
+    if len(valid):
+        hi_idx = valid.idxmax(); lo_idx = valid.idxmin()
+        a, b, c = st.columns(3)
+        a.metric("Highest average-use cell", f"{DAY_NAMES[hi_idx[0]]}, {hi_idx[1]:02d}:00")
+        b.metric("Lowest average-use cell", f"{DAY_NAMES[lo_idx[0]]}, {lo_idx[1]:02d}:00")
+        c.metric("Cells with no observations", f"{int((h['n'] == 0).sum().sum())}/168")
+        st.markdown("### Heatmap insights")
+        top = valid.sort_values(ascending=False).head(5)
+        for (day, hour), value in top.items():
+            st.markdown(f"- **{DAY_NAMES[day]} at {hour:02d}:00** has an average of **{value:.4g} {res['info']['unit_out']}** across {int(h['n'].loc[day, hour])} valid observation(s).")
+        st.caption("These are the highest observed weekday-hour averages, not proof of waste. Check site schedules and whether continuous loads are necessary.")
+    if h["span_days"] < 14:
+        st.warning(f"Only {h['span_days']} day(s) of data are available. Weekly patterns may not be representative.")
+    st.divider()
+    st.subheader("Operating schedule and off-hours usage")
+    sched, configured, errs = schedule_ui(kp)
+    if errs:
+        for e in errs: st.error(e)
+        return
+    oh = offhours_analysis(item["frame"], sched)
+    if oh is None:
+        st.info("No valid observations are available for this comparison.")
+        return
+    cols = st.columns(4)
+    cols[0].metric("In-hours readings", f"{oh['n_in']:,}")
+    cols[1].metric("Off-hours readings", f"{oh['n_off']:,}")
+    cols[2].metric("Mean off-hours usage", fmt(oh["mean_off"], res["info"]["unit_out"]))
+    cols[3].metric("Off-hours energy", f"{oh['energy_off']:,.2f} kWh" if oh["energy_off"] is not None else "Unavailable")
+    st.caption("The default schedule is a weekday 08:00–18:00 assumption until you confirm your own hours. Off-hours use may be legitimate.")
+    st.session_state["block3_offhours"] = {"available": True, "schedule_configured_by_user": configured,
+        "schedule_used": schedule_text(sched) + ("" if configured else " (presumed for exploration, not confirmed by the user)"),
+        "valid_in_schedule_points": oh["n_in"], "valid_off_hours_points": oh["n_off"], "days_with_off_hours_data": oh["off_days"],
+        "mean_off_hours_value": oh["mean_off"], "mean_in_schedule_value": oh["mean_in"],
+        "off_hours_mean_as_fraction_of_in_schedule_mean": (oh["mean_off"] / oh["mean_in"] if oh["mean_off"] is not None and oh["mean_in"] else None),
+        "off_hours_energy_kwh": oh["energy_off"], "off_hours_share_of_total_energy": oh["energy_share"],
+        "highest_off_hours_observations": [], "value_label": item["det"]["label"], "data_span_days": h["span_days"]}
+
+
+def render_peaks_page(item, res, show_ml, kp):
+    st.title("Peak & Anomaly Analysis")
+    st.caption("Statistical peaks are high relative to this dataset. Model anomalies are unusual value/time patterns. Neither identifies a cause by itself.")
     render_series_result(item, res, show_ml)
-    if item["error"]:
-        return "The selected scope has no valid readings in this period, so there is nothing to report on."
-    kp = lambda n: f"b3_{n}_{pick}_{sig[:10]}"
-    render_visuals(item, res, show_ml, kp)
-    render_simulator(item, res, kp)
-    return {"item": item, "res": res, "show_ml": show_ml}
+    st.plotly_chart(build_timeline(item, res, show_ml, True, True), use_container_width=True, key=kp("peaks_timeline"))
+    render_events(item, res, show_ml)
 
 
-def render_analytics(result):
-    ctx = render_analytics_body(result)
-    render_report_section(result, ctx)
+def render_sidebar():
+    st.sidebar.markdown("# EnergyIQ")
+    st.sidebar.caption("Smart energy insights")
+    page = st.sidebar.radio("Navigate", ["Overview", "Heatmap & Ghost Load", "Peak & Anomaly Analysis", "Energy-Shifting Simulator", "Green Sync", "Recommendations", "Data Quality"], key="energyiq_page")
+    st.sidebar.divider()
+    st.sidebar.markdown("**Workflow**")
+    st.sidebar.caption("1. Upload\n\n2. Analyse\n\n3. Explore insights\n\n4. Test actions")
+    return page
 
 
-# ----------------------------------------------------------------------------
-# Main app
-# ----------------------------------------------------------------------------
 def main():
-    st.title("EnergyIQ — Smart Energy Consumption Optimizer")
-    st.write("EnergyIQ turns smart-meter and building energy CSV files into a trustworthy, analysis-ready dataset, then adds "
-             "hourly analytics, statistical peaks, anomaly detection, a Ghost Load heatmap, an energy-shifting what-if simulator, "
-             "a Green Sync scenario and an AI-generated executive mitigation plan. "
-             "Upload any time-series file with timestamps and power or energy measurements, confirm the mapping and units, "
-             "and review the data quality before relying on the results.")
-
-    st.subheader("1. Upload a CSV file")
-    up = st.file_uploader("Drop a CSV file here", type=["csv"])
+    st.markdown("""
+    <style>
+    :root { --beige:#F3EBDD; --beige-deep:#E8DCC8; --terracotta:#C8755D; --blue:#527FA3; --blue-deep:#355D7A; --ink:#293743; }
+    .stApp { background: #FAF7F0; color: var(--ink); }
+    [data-testid="stSidebar"] { background: #F0E5D4; border-right: 1px solid #DDCDB8; }
+    [data-testid="stSidebar"] * { color: #293743; }
+    h1,h2,h3 { color:#355D7A !important; letter-spacing:-0.02em; }
+    [data-testid="stMetric"] { background:#F3EBDD; border:1px solid #E1D3C0; padding:16px 18px; border-radius:14px; }
+    [data-testid="stMetricValue"] { color:#355D7A; }
+    [data-testid="stMetricLabel"] { color:#5B6870; }
+    .stButton > button, .stDownloadButton > button { background:#527FA3; color:#FFFFFF; border:0; border-radius:10px; padding:0.55rem 1rem; }
+    .stButton > button:hover, .stDownloadButton > button:hover { background:#355D7A; color:#FFFFFF; }
+    div[data-testid="stFileUploader"] section { background:#F3EBDD; border:1px dashed #C8755D; border-radius:14px; }
+    div[data-testid="stExpander"] { background:#F7F0E5; border:1px solid #E1D3C0; border-radius:12px; }
+    div[data-baseweb="select"] > div, input, textarea { background:#FFFDF8 !important; }
+    /* Keep all selectable/input text readable on the light input surfaces. */
+    div[data-baseweb="select"] *,
+    div[data-baseweb="input"] *,
+    div[data-baseweb="base-input"] *,
+    div[data-baseweb="popover"] *,
+    ul[role="listbox"] *,
+    [role="option"] *,
+    input, textarea,
+    [data-testid="stNumberInput"] *,
+    [data-testid="stTextInput"] *,
+    [data-testid="stDateInput"] *,
+    [data-testid="stTimeInput"] *,
+    [data-testid="stSelectbox"] *,
+    [data-testid="stMultiSelect"] * { color:#293743 !important; }
+    div[data-baseweb="select"] input,
+    div[data-baseweb="input"] input,
+    input, textarea { -webkit-text-fill-color:#293743 !important; caret-color:#293743 !important; }
+    [data-baseweb="tag"] { background:#E8DCC8 !important; }
+    [data-baseweb="tag"] * { color:#293743 !important; }
+    div[data-testid="stAlert"] { border-radius:10px; background:#F3EBDD; color:#293743; border-color:#C8755D; }
+    div[data-testid="stAlert"] *, div[data-testid="stWidgetLabel"] *, label,
+    [data-baseweb="slider"] *, [data-baseweb="input"] *,
+    [data-testid="stMarkdownContainer"] { color:#293743; }
+    .block-container { padding-top:2rem; padding-bottom:3rem; max-width:1400px; }
+    </style>
+    """, unsafe_allow_html=True)
+    page = render_sidebar()
+    st.title("EnergyIQ")
+    st.caption("Understand energy use. Find unusual patterns. Explore practical actions.")
+    up = st.file_uploader("Upload your energy CSV", type=["csv"], help="Upload a CSV with a date/time column and one or more numeric energy or power measurements.")
     if up is None:
-        for key in ("file_id", "raw", "analysis", "cfg_sig"):
+        st.markdown("### Start with your data")
+        st.write("Upload a CSV to build your energy dashboard. EnergyIQ will identify likely timestamp and measurement columns, then prepare a first-pass analysis.")
+        st.markdown("**Your dashboard includes**")
+        c1,c2,c3 = st.columns(3)
+        c1.markdown("**Consumption overview**\n\nTotal energy, estimated cost and data coverage.")
+        c2.markdown("**Usage patterns**\n\nHeatmaps, peaks, anomalies and off-hours activity.")
+        c3.markdown("**What-if scenarios**\n\nEnergy shifting, Green Sync and recommendations.")
+        for key in ("file_id", "raw", "analysis", "cfg_sig", "block2_results", "block5_report"):
             st.session_state.pop(key, None)
         invalidate_downstream()
-        st.info("Waiting for a CSV file. Supported layouts: one timestamp + one measurement, separate date/time columns, "
-                "several measurement columns, multiple meters/zones, cumulative meter readings, any sampling interval.")
         return
     data = up.getvalue()
     fid = hashlib.md5(data).hexdigest()[:10]
-    if st.session_state.get("file_id") != fid:   # new file: drop everything stale
+    if st.session_state.get("file_id") != fid:
         raw, err = read_csv_safely(data)
-        for key in ("analysis", "cfg_sig"):
+        for key in ("analysis", "cfg_sig", "block2_results", "block5_report"):
             st.session_state.pop(key, None)
         invalidate_downstream()
         st.session_state["file_id"], st.session_state["raw"], st.session_state["read_error"] = fid, raw, err
-    raw, err = st.session_state["raw"], st.session_state["read_error"]
+    raw, err = st.session_state.get("raw"), st.session_state.get("read_error")
     if err:
-        st.error(err)
+        st.error("This file could not be read as a usable CSV. Please check the file and try again.")
         return
-    k = lambda name: f"{name}_{fid}"
-    st.success(f"Loaded '{up.name}': {len(raw):,} rows x {raw.shape[1]} columns.")
-    if len(raw) > 500_000:
-        st.warning("Large file: processing may be slow.")
-
-    st.subheader("2. Data preview")
-    st.dataframe(raw.head(20))
-    with st.expander("Column names and data types"):
-        st.dataframe(pd.DataFrame({"Column": raw.columns, "Type": raw.dtypes.astype(str).values,
-                                   "Missing": raw.isna().sum().values}).astype(str), hide_index=True)
-
-    st.subheader("3. Timestamp configuration")
-    ts_cfg, dayfirst, tz, errs, ts_org = config_timestamp(raw, k)
-    ts_cols = [ts_cfg.get(x) for x in ("col", "date", "time") if ts_cfg.get(x) not in (None, "(select)")]
-
-    st.subheader("4. Measurement, meter and cleaning configuration")
-    st.markdown("**Measurement columns and their meaning**")
-    meas, e2 = config_measurements(raw, k, ts_cols)
-    errs += e2
-    st.markdown("**Meters, buildings or zones**")
-    meter_col, sel, agg, meter_sug = config_meter(raw, k, ts_cols + [m["col"] for m in meas])
-    if meter_col and not sel:
-        errs.append("Select at least one meter to include.")
-    if agg and any(m["mtype"] == "Unknown" for m in meas):
-        st.warning("Summing meters requires known, compatible measurement types and units. Aggregation will be skipped.")
-    st.markdown("**Cleaning rules**")
-    dup, gap, dec, fill, lim, consent = config_cleaning(k)
-    if not consent:
-        errs.append("Interpolation needs your explicit consent.")
-
-    if errs:
-        st.session_state.pop("analysis", None)
-        st.session_state.pop("cfg_sig", None)
-        invalidate_downstream()
-        st.subheader("5. Dataset status")
-        st.error("NOT READY for analysis. Complete the configuration:")
-        for e in errs:
-            st.error(e)
+    if raw is None:
+        st.error("No usable data was found in the uploaded file.")
         return
-
-    cfg = {"ts": ts_cfg, "dayfirst": dayfirst, "tz_name": tz, "meas": meas, "meter_col": meter_col,
-           "meters_selected": sel if meter_col else [], "aggregate": agg, "dup_policy": dup,
-           "gap_factor": float(gap), "decimal": dec, "fill_policy": fill, "fill_limit": int(lim)}
-    sig = hashlib.md5((fid + json.dumps(cfg, sort_keys=True, default=str)).encode()).hexdigest()
-    if st.session_state.get("cfg_sig") != sig:    # mapping changed: recompute and drop stale results
-        invalidate_downstream()
-        with st.spinner("Cleaning data..."):
+    st.success(f"File ready · {len(raw):,} rows · {raw.shape[1]} columns")
+    sug = suggest_timestamp(raw)
+    cands = numeric_like_columns(raw, [sug.get("col") if sug and sug.get("mode") == "single" else ""])
+    scored, top = suggest_measurements(cands)
+    # Keep the primary interaction short. Only show mapping choices when the automatic guess is weak.
+    with st.expander("Review data mapping (optional)", expanded=not bool(sug and cands and top)):
+        object_cols = [c for c in raw.columns if not pd.api.types.is_numeric_dtype(raw[c])]
+        ts_mode_options = ["Single timestamp column", "Separate date and time columns"]
+        ts_mode_default = 1 if sug and sug.get("mode") == "pair" else 0
+        ts_mode = st.radio("Timestamp format", ts_mode_options, index=ts_mode_default, horizontal=True, key=f"map_tsmode_{fid}")
+        ts_col, date_col, time_col = None, None, None
+        epoch_choice = "Parse as text dates"
+        if ts_mode == ts_mode_options[0]:
+            likely_ts = sug["col"] if sug and sug.get("mode") == "single" else (object_cols[0] if object_cols else raw.columns[0])
+            ts_col = st.selectbox("Timestamp column", list(raw.columns), index=list(raw.columns).index(likely_ts), key=f"map_ts_{fid}")
+            if pd.api.types.is_numeric_dtype(raw[ts_col]):
+                epoch_choice = st.selectbox("Numeric timestamp format", ["Parse as text dates", "Unix epoch seconds", "Unix epoch milliseconds"], key=f"map_epoch_{fid}")
+            excluded_time_cols = [ts_col]
+        else:
+            date_default = sug["date"] if sug and sug.get("mode") == "pair" else (object_cols[0] if object_cols else raw.columns[0])
+            time_candidates = [c for c in raw.columns if c != date_default]
+            time_default = sug["time"] if sug and sug.get("mode") == "pair" else (time_candidates[0] if time_candidates else raw.columns[-1])
+            tc1, tc2 = st.columns(2)
+            date_col = tc1.selectbox("Date column", list(raw.columns), index=list(raw.columns).index(date_default), key=f"map_date_{fid}")
+            time_opts = [c for c in raw.columns if c != date_col]
+            if not time_opts:
+                st.warning("Choose separate date and time columns.")
+                return
+            time_col = tc2.selectbox("Time column", time_opts, index=time_opts.index(time_default) if time_default in time_opts else 0, key=f"map_time_{fid}")
+            excluded_time_cols = [date_col, time_col]
+        cands_now = numeric_like_columns(raw, excluded_time_cols)
+        if not cands_now:
+            st.warning("No numeric measurement columns were detected. Check the CSV format.")
+            return
+        likely_measure = top[0] if top and top[0] in cands_now else cands_now[0]
+        meas_col = st.selectbox("Measurement column", cands_now, index=cands_now.index(likely_measure), key=f"map_meas_{fid}")
+        nm = norm(meas_col)
+        inferred_type = "Cumulative meter reading" if any(x in nm for x in ("cumulative", "meter_reading", "total_reading", "register")) else ("Power" if any(x in nm for x in ("kw", "power", "watt", "demand")) and "kwh" not in nm else "Energy per interval")
+        mtype = st.selectbox("What does this column represent?", MTYPES, index=MTYPES.index(inferred_type), key=f"map_type_{fid}")
+        unit_default = next((u for u in UNITS[mtype] if re.search(r"(?<![a-z])" + re.escape(u.lower()) + r"(?![a-z])", nm)), None)
+        if unit_default is None: unit_default = {"Power":"kW", "Energy per interval":"kWh", "Cumulative meter reading":"kWh", "Unknown":"Unknown"}[mtype]
+        unit = st.selectbox("Measurement unit", UNITS[mtype], index=UNITS[mtype].index(unit_default), key=f"map_unit_{fid}_{mtype}")
+        meter_options = ["(none — one meter)"] + [c for c in raw.columns if c not in (ts_col, meas_col)]
+        suggested_meter, _ = suggest_meter(raw, [ts_col, meas_col])
+        meter_index = meter_options.index(suggested_meter) if suggested_meter in meter_options else 0
+        meter_choice = st.selectbox("Optional meter / building / zone column", meter_options, index=meter_index, key=f"map_meter_{fid}")
+        dayfirst = st.checkbox("Dates use day/month/year order", value=False, key=f"map_dayfirst_{fid}")
+    if st.button("Analyse file", type="primary", use_container_width=True, key=f"analyse_{fid}"):
+        cfg, cfg_err = infer_quick_config(raw, ts_col or date_col, meas_col, mtype, unit, "" if meter_choice.startswith("(none") else meter_choice)
+        if ts_mode == "Separate date and time columns":
+            cfg["ts"] = {"mode": "pair", "date": date_col, "time": time_col, "epoch": None}
+        else:
+            cfg["ts"]["epoch"] = {"Unix epoch seconds": "s", "Unix epoch milliseconds": "ms"}.get(epoch_choice)
+        cfg["dayfirst"] = dayfirst
+        if cfg_err:
+            st.error(cfg_err)
+            return
+        sig = hashlib.md5((fid + json.dumps(cfg, sort_keys=True, default=str)).encode()).hexdigest()
+        with st.spinner("Preparing your dashboard…"):
             clean, rep = clean_dataset(raw, cfg)
-        st.session_state["analysis"] = {"clean": clean, "report": rep, "config": cfg} if clean is not None and not rep["errors"] else {"clean": None, "report": rep, "config": cfg}
+        if clean is None or rep["errors"]:
+            st.session_state["analysis"] = {"clean": clean, "report": rep, "config": cfg}
+            st.session_state["cfg_sig"] = sig
+            st.error("The file needs a mapping adjustment before it can be analysed. Open ‘Review data mapping’ and check the timestamp, measurement type and unit.")
+            for message in rep["errors"]: st.warning(message)
+            return
+        st.session_state["analysis"] = {"clean": clean, "report": rep, "config": cfg}
         st.session_state["cfg_sig"] = sig
-    result = st.session_state["analysis"]
-    origins = {"Timestamp mapping": (", ".join(ts_cols), ts_org),
-               "Measurement type/unit": ("; ".join(f"{m['name']}: {m['mtype']} ({m['unit']})" for m in meas), "declared by you"),
-               "Meter column": (meter_col or "none", origin(meter_col, meter_sug) if meter_col else "n/a")}
-    show_results(result["clean"], result["report"], origins)
-    if result["clean"] is not None and not result["report"]["errors"]:
-        render_analytics(result)
+        st.session_state.pop("block2_results", None)
+        invalidate_downstream()
+        names = list(rep["columns"])
+        name = names[0]
+        meters = sorted(clean["meter"].unique().tolist()) if "meter" in clean.columns else []
+        targets = meters if meters else [None]
+        lo, hi = clean["timestamp"].min().date(), clean["timestamp"].max().date()
+        period = (lo, hi)
+        pct, cont = 90.0, 0.05
+        try:
+            with st.spinner("Running peak and anomaly analysis…"):
+                res = run_analysis(clean, rep, name, targets, period, pct, cont, True, None, cfg["gap_factor"])
+            base_sig = hashlib.md5(json.dumps([sig, name, [str(t) for t in targets], [str(p) for p in period], pct]).encode()).hexdigest()
+            ml_sig = hashlib.md5((base_sig + str(cont)).encode()).hexdigest()
+            res.update({"base_sig": base_sig, "ml_sig": ml_sig})
+            st.session_state["block2_results"] = res
+            st.success("Analysis complete. Your dashboard is ready.")
+        except Exception:
+            st.error("The file was cleaned, but the analysis could not be completed. Please review the mapping and try again.")
+    result = st.session_state.get("analysis")
+    if not result or result.get("clean") is None or result["report"].get("errors"):
+        st.info("Upload a file and select **Analyse file** to continue.")
+        return
+    # Use the saved analysis result. If the user changed the upload, this is invalidated above.
+    clean, rep = result["clean"], result["report"]
+    res = st.session_state.get("block2_results")
+    if not res:
+        st.info("Select **Analyse file** to prepare the analysis dashboard.")
+        return
+    labels = [("dataset" if it["meter"] is None else str(it["meter"])) for it in res["series"]]
+    if len(labels) > 1:
+        chosen_scope = st.sidebar.selectbox("Meter / zone", labels, key=f"scope_{sig}")
+        idx = labels.index(chosen_scope)
     else:
-        render_report_section(result, "The dataset is not ready for analysis, so no report can be generated. Fix the issues listed above.")
-    st.caption("EnergyIQ prototype: all figures are estimates from the uploaded data and the assumptions you set. "
-               "Statistical peaks, anomalies, simulations and AI text are decision aids, not proof of faults, savings or carbon reduction.")
+        idx = 0
+    item = res["series"][idx]
+    show_ml = bool(res.get("ran_ml") and res.get("ml_sig"))
+    ctx = {"item": item, "res": res, "show_ml": show_ml} if not item.get("error") else "The selected scope does not contain valid readings."
+    sig = st.session_state.get("cfg_sig", "")[:10]
+    kp = lambda n: f"page_{n}_{sig}"
+    if page == "Overview":
+        render_overview(result, ctx)
+    elif page == "Heatmap & Ghost Load":
+        render_heatmap_page(item, res, kp)
+    elif page == "Peak & Anomaly Analysis":
+        render_peaks_page(item, res, show_ml, kp)
+    elif page == "Energy-Shifting Simulator":
+        st.title("Energy-Shifting Simulator")
+        render_simulator(item, res, kp, include_green_sync=False)
+    elif page == "Green Sync":
+        st.title("Green Sync")
+        summary = st.session_state.get("block4_summary", {})
+        total_kwh = summary.get("total_energy_simulated_kwh") if summary.get("available") else get_energy_total(clean, rep, res["name"])
+        render_green_sync(kp, total_kwh)
+    elif page == "Recommendations":
+        render_report_section(result, ctx)
+    elif page == "Data Quality":
+        st.title("Data Quality")
+        origins = {"Timestamp mapping": (result["config"]["ts"].get("col", "timestamp"), "automatic or user-confirmed"),
+                   "Measurement type/unit": ("; ".join(f"{m['name']}: {m['mtype']} ({m['unit']})" for m in result["config"]["meas"]), "confirmed in mapping"),
+                   "Meter column": (result["config"].get("meter_col") or "none", "optional")}
+        show_results(clean, rep, origins)
+        with st.expander("Preview uploaded data"):
+            st.dataframe(raw.head(30), use_container_width=True)
+        st.download_button("Download cleaned CSV", clean.to_csv(index=False).encode("utf-8"), file_name="energyiq_cleaned.csv", mime="text/csv", key="download_cleaned_csv_data_quality")
+    st.sidebar.caption(f"Loaded {len(clean):,} cleaned readings")
+    st.caption("EnergyIQ provides estimates from the uploaded data and stated assumptions. Peaks and anomalies are investigation prompts; simulations are not guaranteed savings.")
 
 
 if __name__ == "__main__":
