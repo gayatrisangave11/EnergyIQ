@@ -1,0 +1,39 @@
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Editor and operating system files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated model artifacts — uncomment if not required in the repository
+# *.pkl
+# *.joblib
+# *.h5
+# *.pt
+# *.pth
+
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
