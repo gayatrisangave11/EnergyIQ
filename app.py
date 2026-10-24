@@ -1,9 +1,12 @@
+
 """EnergyIQ - Smart Energy Consumption Optimizer (final prototype, Blocks 1-5)
 Block 1: foundation, CSV upload, validation, column mapping and cleaning.
 Block 2: hourly analytics, statistical peaks, IsolationForest anomalies.
 Block 3: Plotly timeline, peak/anomaly highlighting, Ghost Load heatmap, off-hours analysis.
 Block 4: energy-shifting what-if simulator, illustrative carbon, Green Sync scenario.
 Block 5: Groq-powered executive report grounded in a compact evidence summary.
+Block 6: insight engine (always-on load, inferred quiet hours, ranked unusual events, ranked opportunities in rupees,
+         health score, solar alignment). Deterministic: the language model only verbalises these numbers.
 
 Design rules shared by all blocks:
   * Every block reads the dataset through the session key "analysis" (see get_analysis()).
@@ -309,6 +312,27 @@ def clean_dataset(raw, cfg):
         if rep["n_missing_meter"]:
             rep["warnings"].append(f"{rep['n_missing_meter']:,} valid rows have no meter/zone id and are grouped as '(missing id)'.")
     names = [m["name"] for m in cfg["meas"]]
+    # Retain usable environmental/operational context columns (e.g. temperature,
+    # humidity, occupancy, production) so later analysis can test associations.
+    # These columns are context only: they are not treated as energy measurements.
+    context_cols = []
+    excluded_source_cols = {cfg.get("ts", {}).get("col"), cfg.get("ts", {}).get("date"),
+                            cfg.get("ts", {}).get("time"), cfg.get("meter_col")}
+    excluded_source_cols.update(m["col"] for m in cfg["meas"])
+    context_tokens = ("temp", "humidity", "humid", "weather", "occup", "production",
+                      "output", "footfall", "people", "co2", "pressure", "solar", "irradiance")
+    for source_col in raw_v.columns:
+        if source_col in excluded_source_cols:
+            continue
+        source_name = str(source_col)
+        if not any(tok in norm(source_name) for tok in context_tokens):
+            continue
+        vals, _, _ = to_numeric_series(raw_v[source_col], cfg["decimal"])
+        if vals.notna().sum() >= max(3, int(0.1 * len(raw_v))):
+            safe_name = f"context__{source_name}"
+            work[safe_name] = vals.to_numpy()
+            context_cols.append(safe_name)
+    rep["context_columns"] = context_cols
     for m in cfg["meas"]:
         num, n_miss, n_inv = to_numeric_series(raw_v[m["col"]], cfg["decimal"])
         work[m["name"]] = num.to_numpy()
@@ -651,6 +675,10 @@ def show_results(clean, rep, origins):
     st.markdown("- Suggested mappings are automatic guesses; units and measurement types are never inferred from column names.")
     st.markdown("- No missing values were set to zero and no readings were invented for gaps.")
 
+    if rep.get("context_columns"):
+        st.subheader("Context fields retained for interpretation")
+        st.caption("These numeric fields are retained for exploratory association checks only; they are not included in the energy total or treated as energy measurements.")
+        st.write(", ".join(c.replace("context__", "") for c in rep["context_columns"]))
     st.subheader("7. Cleaned data preview")
     st.dataframe(clean.head(100))
     st.download_button("Download cleaned CSV", clean.to_csv(index=False).encode("utf-8"),
@@ -1042,62 +1070,6 @@ def build_heatmap(item, res):
     return fig
 
 
-def schedule_ui(k):
-    """Operating schedule: dict weekday -> (start_min, end_min) or None. Returns (schedule, configured, errors)."""
-    custom = st.checkbox("Use my own operating schedule", key=k("sched_custom"),
-                         help="Without this, a presumed Mon-Fri 08:00-18:00 schedule is used for exploration only.")
-    if not custom:
-        st.info("No schedule configured. A presumed Mon-Fri 08:00-18:00 schedule is used only to explore the data. "
-                "Results are labelled 'potential off-hours consumption', not confirmed ghost load.")
-        return {d: ((480, 1080) if d < 5 else None) for d in range(7)}, False, []
-    sched, errs = {}, []
-    st.caption("Set the days and hours when the site or area is expected to be active. Use end 00:00 for midnight.")
-    for d, name in enumerate(DAY_NAMES):
-        c = st.columns([1, 1, 1])
-        op = c[0].checkbox(name, value=d < 5, key=k(f"sd_{d}"))
-        s = c[1].time_input("Start", dtime(8, 0), key=k(f"ss_{d}"), disabled=not op, label_visibility="collapsed")
-        e = c[2].time_input("End", dtime(18, 0), key=k(f"se_{d}"), disabled=not op, label_visibility="collapsed")
-        if not op:
-            sched[d] = None
-            continue
-        sm, em = s.hour * 60 + s.minute, (e.hour * 60 + e.minute) or 1440
-        if em <= sm:
-            errs.append(f"{name}: end must be after start (overnight shifts are not supported; leave the day closed or split it).")
-        sched[d] = (sm, em)
-    return sched, True, errs
-
-
-def schedule_text(sched):
-    """Compact human-readable schedule, e.g. 'Mon 08:00-18:00; Sat closed'."""
-    parts = []
-    for d in range(7):
-        w = sched[d]
-        parts.append(f"{DAY_NAMES[d]} " + (f"{w[0] // 60:02d}:{w[0] % 60:02d}-{w[1] // 60:02d}:{w[1] % 60:02d}" if w else "closed"))
-    return "; ".join(parts)
-
-
-def offhours_analysis(frame, sched):
-    """Split valid points into inside / outside the schedule. A point belongs to the hour or reading
-    that starts at its timestamp."""
-    f = frame[np.isfinite(frame["value"].astype(float))].copy()
-    if f.empty:
-        return None
-    starts = np.array([sched[d][0] if sched[d] else np.nan for d in range(7)])
-    ends = np.array([sched[d][1] if sched[d] else np.nan for d in range(7)])
-    dow = f["timestamp"].dt.dayofweek.to_numpy()
-    m = (f["timestamp"].dt.hour * 60 + f["timestamp"].dt.minute).to_numpy()
-    f["in_schedule"] = (m >= starts[dow]) & (m < ends[dow])
-    inside, off = f[f["in_schedule"]], f[~f["in_schedule"]]
-    out = {"n_in": len(inside), "n_off": len(off), "off": off, "mean_in": inside["value"].mean() if len(inside) else None,
-           "mean_off": off["value"].mean() if len(off) else None, "median_off": off["value"].median() if len(off) else None,
-           "off_days": int(off["timestamp"].dt.normalize().nunique()) if len(off) else 0, "energy_off": None, "energy_share": None}
-    if f["energy_kwh"].notna().any() and len(off):
-        out["energy_off"] = float(off["energy_kwh"].sum())
-        tot = float(f["energy_kwh"].sum())
-        out["energy_share"] = out["energy_off"] / tot if tot > 0 else None
-    return out
-
-
 def render_events(item, res, show_ml):
     info, det = res["info"], item["det"]
     unit = info["unit_out"] if info["unit_out"] != "unknown" else ""
@@ -1185,73 +1157,7 @@ def render_visuals(item, res, show_ml, kp):
             st.info("Readings are coarser than hourly, so an hour-of-day pattern cannot be shown.")
         st.plotly_chart(build_heatmap(item, res), key=kp("hm_fig"))
 
-    st.subheader("Operating Schedule and Off-Hours Analysis")
-    st.caption("Ghost load means consumption continuing when a site or area is expected to be inactive. "
-               "Define when it is active, then compare. Security, refrigeration, servers or ventilation may legitimately run all the time.")
-    if det["reliable"] and det["interval_s"] and det["interval_s"] > 3600 * 1.01:
-        st.info("Readings are coarser than hourly (e.g. daily), so time-of-day schedule analysis is not possible for this data.")
-        st.session_state["block3_offhours"] = {"available": False, "reason": "Readings are coarser than hourly, so time-of-day schedule analysis is not possible."}
-        return
-    sched, configured, errs = schedule_ui(kp)
-    if errs:
-        for e in errs:
-            st.error(e)
-        st.session_state["block3_offhours"] = {"available": False, "reason": "The operating schedule entered by the user is invalid."}
-        return
-    oh = offhours_analysis(frame, sched)
-    if oh is None:
-        st.warning("There are no valid observations to analyse.")
-        st.session_state["block3_offhours"] = {"available": False, "reason": "No valid observations."}
-        return
-    term = "Outside-schedule" if configured else "Potential off-hours (presumed schedule, unconfirmed)"
-    st.markdown(f"**{term} summary**")
-    if not det["hourly"]:
-        st.caption("A reading counts as in-schedule when its timestamp falls inside the schedule.")
-    else:
-        st.caption("An hour counts as in-schedule when its start time falls inside the schedule.")
-    m = st.columns(4)
-    m[0].metric("Valid in-schedule points", f"{oh['n_in']:,}")
-    m[1].metric("Valid off-hours points", f"{oh['n_off']:,}")
-    m[2].metric(f"Mean off-hours ({det['label']})", fmt(oh["mean_off"]))
-    m[3].metric("Mean in-schedule", fmt(oh["mean_in"]))
-    m2 = st.columns(3)
-    ratio = (oh["mean_off"] / oh["mean_in"]) if oh["mean_off"] is not None and oh["mean_in"] else None
-    m2[0].metric("Off-hours mean vs in-schedule mean", f"{ratio:.0%}" if ratio is not None else "n/a")
-    m2[1].metric("Off-hours energy (kWh)", fmt(oh["energy_off"]) if oh["energy_off"] is not None else "Unavailable",
-                 help="Needs a known energy/power type and unit.")
-    m2[2].metric("Share of total energy", f"{oh['energy_share']:.1%}" if oh["energy_share"] is not None else "Unavailable")
-    if oh["n_off"] < 10:
-        st.warning(f"Only {oh['n_off']} valid off-hours points. This is too little history for a reliable off-hours picture.")
-    elif h and h["span_days"] < 14:
-        st.warning("Less than two weeks of data: off-hours figures may not be representative.")
-    top_obs = []
-    if oh["n_off"]:
-        off = oh["off"].copy()
-        off["Statistical peak"] = off["statistical_peak"]
-        off["ML anomaly"] = off["ml_anomaly"]
-        st.markdown(f"**Highest {term.lower()} observations**")
-        top = off.sort_values("value", ascending=False).head(15)[["timestamp", "value", "day_of_week", "Statistical peak", "ML anomaly"]]
-        st.dataframe(top.rename(columns={"value": det["label"]}), hide_index=True)
-        top_obs = [{"timestamp": str(r.timestamp), "value": r.value} for r in top.head(3).itertuples()]
-        daily = off.groupby(off["timestamp"].dt.normalize())["value"].agg(["mean", "max", "count"]).reset_index()
-        fig = go.Figure(go.Bar(x=daily["timestamp"], y=daily["mean"], name="Daily mean off-hours",
-                               hovertemplate=f"%{{x|%Y-%m-%d}}<br>Mean: %{{y:.4g}} {unit}<extra></extra>"))
-        fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Date",
-                          yaxis_title=f"Mean off-hours: {det['label']}")
-        st.plotly_chart(fig, key=kp("oh_fig"))
-        st.caption(f"Off-hours data were observed on {oh['off_days']} day(s). Days without valid off-hours readings are not shown as zero.")
-    st.caption("These figures describe observed consumption outside the schedule you defined. They do not establish waste, "
-               "identify an appliance, or explain the cause of any spike.")
-    st.session_state["block3_offhours"] = {
-        "available": True, "schedule_configured_by_user": configured,
-        "schedule_used": schedule_text(sched) + ("" if configured else " (presumed for exploration, not confirmed by the user)"),
-        "valid_in_schedule_points": oh["n_in"], "valid_off_hours_points": oh["n_off"],
-        "days_with_off_hours_data": oh["off_days"],
-        "mean_off_hours_value": oh["mean_off"], "mean_in_schedule_value": oh["mean_in"],
-        "off_hours_mean_as_fraction_of_in_schedule_mean": ratio,
-        "off_hours_energy_kwh": oh["energy_off"], "off_hours_share_of_total_energy": oh["energy_share"],
-        "highest_off_hours_observations": top_obs, "value_label": det["label"],
-        "data_span_days": h["span_days"] if h else None}
+    st.caption("Operating-schedule comparisons are not enabled in this version.")
 
 
 # ----------------------------------------------------------------------------
@@ -1320,11 +1226,8 @@ def render_green_sync(kp, total_kwh):
     ef_nr = c1.number_input("Assumed emissions factor, non-renewable supply (kg CO2e/kWh)", 0.0, 5.0, 0.50, 0.01, key=kp("gs_nr"))
     ef_r = c2.number_input("Assumed emissions factor, renewable supply (kg CO2e/kWh)", 0.0, 5.0, 0.02, 0.01, key=kp("gs_r"))
     st.caption("Both factors are placeholders unless you enter verified values (e.g. from your supplier or national grid data).")
-    fig = go.Figure(go.Indicator(mode="gauge+number", value=share, number=dict(suffix="%"),
-                                 title=dict(text="Assumed renewable share (simulated scenario)"),
-                                 gauge=dict(axis=dict(range=[0, 100]), bar=dict(color="#527FA3"))))
-    fig.update_layout(height=280, margin=dict(l=20, r=20, t=60, b=10))
-    st.plotly_chart(fig, key=kp("gs_fig"))
+    # Green Sync is a decision scenario, not a decorative renewable-share dial:
+    # compare the same measured demand under three explicitly assumed supply mixes.
     green = {"simulated_scenario_only": True, "assumed_renewable_share_pct": share,
              "assumed_factor_non_renewable_kg_co2e_per_kwh": ef_nr, "assumed_factor_renewable_kg_co2e_per_kwh": ef_r,
              "energy_in_scope_kwh": None, "scenario_emissions_kg_co2e": None, "assumed_reduction_vs_0pct_renewable_kg_co2e": None}
@@ -1336,11 +1239,35 @@ def render_green_sync(kp, total_kwh):
     ref = total_kwh * ef_nr
     green.update({"energy_in_scope_kwh": total_kwh, "scenario_emissions_kg_co2e": scen,
                   "assumed_reduction_vs_0pct_renewable_kg_co2e": ref - scen})
+    full_renewable = total_kwh * ef_r
+    scenario_table = pd.DataFrame({
+        "Supply scenario": ["0% renewable (reference)", f"{share}% renewable (selected)", "100% renewable (upper scenario)"],
+        "Assumed renewable share (%)": [0, share, 100],
+        "Estimated emissions (kg CO2e)": [ref, scen, full_renewable],
+    })
+    scenario_table["Difference vs reference (kg CO2e)"] = ref - scenario_table["Estimated emissions (kg CO2e)"]
+    st.markdown("### What does this slider actually change?")
+    st.write(f"For **{fmt(total_kwh)} kWh** of measured electricity, the selected assumption produces an estimated **{fmt(scen)} kg CO₂e**. "
+             f"Compared with the 0% renewable reference, that is **{fmt(ref - scen)} kg CO₂e lower** under the factors entered below. "
+             "This is a supply-mix scenario, not a prediction that the building will save energy or proof that its electricity is renewable.")
     m = st.columns(3)
-    m[0].metric("Energy in scope (kWh)", fmt(total_kwh))
-    m[1].metric("Scenario emissions (kg CO2e)", fmt(scen), help="energy x (share x renewable factor + (1 - share) x non-renewable factor)")
-    m[2].metric("Reduction vs 0% renewable (assumed, kg CO2e)", f"{ref - scen:,.4g}")
-    st.caption("The comparison is between two assumed supply mixes for the same energy use. It is not carbon actually avoided.")
+    m[0].metric("Energy demand (unchanged)", f"{fmt(total_kwh)} kWh")
+    m[1].metric("Estimated emissions at selected share", f"{fmt(scen)} kg CO₂e")
+    m[2].metric("Difference vs reference scenario", f"{fmt(ref - scen)} kg CO₂e")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=scenario_table["Supply scenario"], y=scenario_table["Estimated emissions (kg CO2e)"],
+                         marker_color=["#527FA3", "#C8755D", "#6F9BB8"],
+                         text=[f"{v:,.3g}" for v in scenario_table["Estimated emissions (kg CO2e)"]],
+                         textposition="outside", name="Estimated emissions"))
+    fig.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20), showlegend=False,
+                      yaxis_title="Estimated emissions (kg CO₂e)", xaxis_title="Assumed supply mix")
+    st.plotly_chart(fig, key=kp("gs_fig"))
+    st.dataframe(scenario_table, use_container_width=True, hide_index=True)
+    st.markdown("**How to use this result**")
+    st.markdown("- Use a supplier- or grid-specific emissions factor where available; record its source and year.\n"
+                "- Treat a higher renewable share as a procurement/on-site-generation scenario, not an efficiency action.\n"
+                "- To estimate demand-reduction benefits, reduce the energy quantity in a separate efficiency scenario; do not confuse that with changing the supply mix.")
+    st.caption("Emissions are estimated as energy × weighted emissions factor. The difference is relative to an assumed 0% renewable mix, not measured carbon actually avoided.")
 
 
 def render_simulator(item, res, kp, include_green_sync=True):
@@ -1484,14 +1411,701 @@ def render_simulator(item, res, kp, include_green_sync=True):
                    "avoided_by_timing_kg_co2e": r["co2_timing_diff"] if tv else 0.0,
                    "avoided_by_less_energy_kg_co2e": r["co2_energy_diff"],
                    "note": "Illustrative: depends on user-assumed factors; shifting does not reduce total energy."},
+        "scenario_params": {"mode": mode, "days": list(days), "start": int(start), "end": int(end), "base": base_price,
+                            "peak": peak_price, "frac": pct / 100.0, "ef": ef, "ef_exp": ef_exp, "ef_oth": ef_oth},
         "note": "Gross energy-cost estimate under the stated assumptions; not a bill and not a guaranteed saving."}
     if include_green_sync:
         render_green_sync(kp, r["energy_sim"])
 
 
 # ----------------------------------------------------------------------------
-# Block 5: Groq-powered executive report
+# Insight engine: deterministic, evidence-based analytics (no LLM involved).
+# It reads the hourly frame produced by the existing pipeline and answers
+# "so what?": how much is always-on, what happens outside normal hours, which
+# unusual events cost the most, and which actions are worth the most rupees.
 # ----------------------------------------------------------------------------
+DEFAULT_BASE_RATE = 8.0             # INR per kWh, illustrative (user can change it in the simulator)
+DEFAULT_PEAK_RATE = 12.0            # INR per kWh, illustrative
+IDLE_REDUCTION_ASSUMPTION = 0.20    # share of quiet-hour energy assumed avoidable (shown as an assumption)
+EVENT_AVOIDABLE_ASSUMPTION = 0.50   # share of excess energy in unusual events assumed avoidable
+ACTIVE_LEVEL = 0.40                 # an hour is 'active' when its typical load is above floor + 40% of the daily range
+FLAT_PROFILE_RATIO = 0.15           # daily range below 15% of the peak = no clear working pattern
+MATERIAL_EVENT_RATIO = 1.25         # an event matters when its peak is at least 1.25x the expected level
+
+
+def inr(x, nd=0, sign=False):
+    """Indian digit grouping (12,34,567) with a rupee sign. Display only."""
+    if x is None or not np.isfinite(x):
+        return "n/a"
+    neg = x < 0
+    s = f"{abs(x):.{nd}f}"
+    whole, _, frac = s.partition(".")
+    if len(whole) > 3:
+        head, tail, parts = whole[:-3], whole[-3:], []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        whole = ",".join(parts + [tail])
+    return ("-" if neg else ("+" if sign else "")) + "₹" + whole + ("." + frac if frac else "")
+
+
+def sim_settings():
+    """Scenario settings: the user's simulator inputs when available, otherwise transparent defaults."""
+    s = {"mode": MODE_ILLUS, "days": [0, 1, 2, 3, 4], "start": 14, "end": 18, "base": DEFAULT_BASE_RATE,
+         "peak": DEFAULT_PEAK_RATE, "frac": 0.25, "ef": 0.40, "ef_exp": 0.40, "ef_oth": 0.40, "from_user": False}
+    summ = st.session_state.get("block4_summary") or {}
+    p = summ.get("scenario_params") if summ.get("available") else None
+    if p:
+        s.update({k: v for k, v in p.items() if k in s})
+        s["from_user"] = True
+    return s
+
+
+def hour_ranges(hours):
+    """[20, 21, 22, 23, 0, 1] -> '20:00-02:00' (circular, readable)."""
+    hours = sorted({int(h) for h in hours})
+    if not hours:
+        return "none"
+    if len(hours) == 24:
+        return "all day"
+    runs, start, prev = [], hours[0], hours[0]
+    for h in hours[1:]:
+        if h == prev + 1:
+            prev = h
+            continue
+        runs.append((start, prev))
+        start = prev = h
+    runs.append((start, prev))
+    if len(runs) > 1 and runs[0][0] == 0 and runs[-1][1] == 23:
+        first, last = runs.pop(0), runs.pop()
+        runs.append((last[0], first[1]))
+    return ", ".join(f"{a:02d}:00-{(b + 1) % 24:02d}:00" for a, b in runs)
+
+
+def event_hint(span_h, ratio, off_frac):
+    """Hypothesis to check for an unusual event. Never a diagnosis."""
+    if off_frac >= 0.5:
+        return "Mostly in a normally quiet period: check for after-hours activity, equipment left on or an overridden schedule."
+    if span_h >= 4:
+        return "Sustained increase: check for equipment left running, changed set-points or a long activity."
+    if span_h <= 1.5 and ratio and ratio >= 2:
+        return "Short, sharp spike: check simultaneous start-ups of large motors/compressors, or a metering glitch."
+    return "Moderate deviation: compare with the same hour on other days and note what operated then."
+
+
+def solar_availability(h):
+    """Assumed solar availability for hour h (0-23): a sine curve between 06:00 and 18:00 peaking at midday."""
+    return float(max(0.0, np.sin(np.pi * (h + 0.5 - 6) / 12)))
+
+
+def compute_insights(item, res, show_ml):
+    """Everything the dashboard and the report need, from the existing hourly frame."""
+    out = {"available": False, "reason": None}
+    if not item or item.get("error"):
+        out["reason"] = "No valid readings in this scope."
+        return out
+    det = item["det"]
+    if not det["hourly"]:
+        out["reason"] = "Readings are coarser than hourly or irregular, so hour-of-day insights are not available for this data."
+        return out
+    frame = item["frame"].copy()
+    ml_ok = bool(show_ml and item.get("ml"))
+    if not ml_ok:
+        frame["ml_anomaly"] = False
+    valid = frame[frame["value"].notna()]
+    has_kwh = bool(valid["energy_kwh"].notna().any())
+    x = (valid["energy_kwh"] if has_kwh else valid["value"]).astype(float)
+    d = pd.DataFrame({"ts": valid["timestamp"].to_numpy(), "x": x.to_numpy(),
+                      "flag": (valid["ml_anomaly"] if ml_ok else valid["statistical_peak"]).astype(bool).to_numpy()})
+    d = d[d["x"].notna()].reset_index(drop=True)
+    if len(d) < 48:
+        out["reason"] = "Fewer than 48 valid hours: too little history for pattern-based insights."
+        return out
+    S = sim_settings()
+    d["date"] = d["ts"].dt.normalize()
+    d["hour"] = d["ts"].dt.hour
+    d["dow"] = d["ts"].dt.dayofweek
+    d["daytype"] = np.where(d["dow"] >= 5, "Weekend", "Weekday")
+    total = float(d["x"].sum())
+    span_days = int((d["ts"].max() - d["ts"].min()).days + 1)
+    coverage = len(d) / max(len(frame), 1)
+    conf = "High" if span_days >= 28 else ("Medium" if span_days >= 14 else "Low")
+    if coverage < 0.8:
+        conf = {"High": "Medium", "Medium": "Low"}.get(conf, "Low")
+    rate = S["base"] if has_kwh else None
+    unit = "kWh" if has_kwh else "units"
+    money = (lambda kwh: kwh * rate) if rate is not None else (lambda kwh: None)
+    year = (lambda v: v * 365.0 / span_days if (v is not None and span_days >= 7) else None)
+
+    # --- load shape KPIs -------------------------------------------------------
+    mean_x, max_x = float(d["x"].mean()), float(d["x"].max())
+    load_factor = mean_x / max_x if max_x > 0 else None
+    peak_at = d.loc[d["x"].idxmax(), "ts"]
+    g = d.groupby("date")["x"]
+    cnt, low3 = g.size(), g.apply(lambda s: s.nsmallest(3).mean())
+    ok_days = low3[cnt >= 18]
+    base = float(ok_days.median()) if len(ok_days) >= 3 else float(np.percentile(d["x"], 10))
+    base_share = min(base * len(d) / total, 1.0) if total > 0 else None
+
+    # --- inferred operating pattern (nothing to enter: learned from the data) ----
+    prof = d.groupby(["daytype", "hour"])["x"].median().unstack("daytype").reindex(range(24))
+    rng_ = {t: (float(prof[t].min()), float(prof[t].max())) for t in prof.columns if prof[t].notna().sum() >= 12}
+    pattern_flat, active = True, {}
+    if rng_:
+        # One shared threshold, learned from the day type with the widest daily swing (normally weekdays),
+        # so a weekend that never reaches working-day levels is correctly seen as quiet all day.
+        ref_t = max(rng_, key=lambda t: rng_[t][1] - rng_[t][0])
+        lo, hi = rng_[ref_t]
+        pattern_flat = bool(hi <= 0 or (hi - lo) < FLAT_PROFILE_RATIO * hi)
+        thr = lo + ACTIVE_LEVEL * (hi - lo)
+        for t in rng_:
+            active[t] = {h: bool(pattern_flat or pd.isna(prof[t][h]) or prof[t][h] >= thr) for h in range(24)}
+    d["active"] = [active.get(t, {}).get(h, True) for t, h in zip(d["daytype"], d["hour"])]
+    off, act = d[~d["active"]], d[d["active"]]
+    off_kwh = float(off["x"].sum())
+    off_share = off_kwh / total if total > 0 else None
+    idle_ratio = (float(off["x"].mean()) / float(act["x"].mean())
+                  if len(off) and len(act) and act["x"].mean() > 0 else None)
+    ghost_excess = float(np.maximum(off["x"] - base, 0).sum()) if len(off) else 0.0
+    wk_hours = [h for h, a in active.get("Weekday", {}).items() if a]
+    we_hours = [h for h, a in active.get("Weekend", {}).items() if a]
+    quiet_wk = [h for h, a in active.get("Weekday", {}).items() if not a]
+
+    # --- days -----------------------------------------------------------------------
+    daily = d.groupby("date")["x"].agg(kwh="sum", n="size")
+    comp = daily[daily["n"] >= 20].copy()
+    wk_avg = we_avg = ratio_we = None
+    comp["dt"] = np.where(comp.index.dayofweek >= 5, "Weekend", "Weekday")
+    if (comp["dt"] == "Weekday").any():
+        wk_avg = float(comp.loc[comp["dt"] == "Weekday", "kwh"].mean())
+    if (comp["dt"] == "Weekend").any():
+        we_avg = float(comp.loc[comp["dt"] == "Weekend", "kwh"].mean())
+    if wk_avg and we_avg is not None and wk_avg > 0:
+        ratio_we = we_avg / wk_avg
+    comp["expected"] = comp.groupby("dt")["kwh"].transform("median")
+    mad = comp.groupby("dt")["kwh"].transform(lambda s: (s - s.median()).abs().median())
+    sigma = (1.4826 * mad).where(mad > 0)
+    comp["z"] = (comp["kwh"] - comp["expected"]) / sigma
+    comp["abnormal"] = (comp["z"] >= 2.5) & (comp.groupby("dt")["kwh"].transform("size") >= 5)
+    night = d.loc[d["hour"] < 6, "x"].mean()
+    dayt = d.loc[(d["hour"] >= 8) & (d["hour"] < 18), "x"].mean()
+    night_day = float(night / dayt) if pd.notna(night) and pd.notna(dayt) and dayt > 0 else None
+
+    # --- unusual events: grouped, ranked by the energy above what was expected ------
+    ref = d[~d["flag"]] if (~d["flag"]).sum() >= 24 else d
+    exp_dh = ref.groupby(["dow", "hour"])["x"].agg(["median", "count"])
+    med_dh, cnt_dh = exp_dh["median"].to_dict(), exp_dh["count"].to_dict()
+    med_h, overall = ref.groupby("hour")["x"].median().to_dict(), float(ref["x"].median())
+    d["expected"] = [med_dh[(a, b)] if cnt_dh.get((a, b), 0) >= 3 else med_h.get(b, overall)
+                     for a, b in zip(d["dow"], d["hour"])]
+    d["excess"] = np.maximum(d["x"] - d["expected"], 0.0)
+    rows = []
+    fl = d[d["flag"]]
+    if len(fl):
+        eid = (fl["ts"].diff().dt.total_seconds().div(3600).fillna(0) > 2.01).cumsum()
+        for _, e in fl.groupby(eid):
+            pk = e.loc[e["x"].idxmax()]
+            span_h = (e["ts"].max() - e["ts"].min()).total_seconds() / 3600 + 1
+            ratio = float(pk["x"] / pk["expected"]) if pk["expected"] > 0 else None
+            off_frac = float((~e["active"]).mean())
+            exc = float(e["excess"].sum())
+            rows.append({"start": e["ts"].min(), "end": e["ts"].max() + pd.Timedelta(hours=1), "hours": span_h,
+                         "peak": float(pk["x"]), "expected": float(pk["expected"]), "ratio": ratio,
+                         "excess": exc, "cost": money(exc), "off_frac": off_frac,
+                         "check": event_hint(span_h, ratio, off_frac)})
+    events = pd.DataFrame(rows)
+    if len(events):
+        events = events.sort_values("excess", ascending=False).reset_index(drop=True)
+        material = events[events["ratio"].fillna(0) >= MATERIAL_EVENT_RATIO]
+    else:
+        material = events
+    events_excess = float(material["excess"].sum()) if len(material) else 0.0
+    events_share = events_excess / total if total > 0 else None
+
+    # --- peak-hour exposure and the best shift (uses the existing simulator maths) ------
+    shift = None
+    fr = item["frame"]
+    if has_kwh and fr["energy_kwh"].notna().sum() >= 24:
+        try:
+            exp = expensive_mask(fr, S["mode"], S["days"], S["start"], S["end"])
+            okmask = fr["energy_kwh"].notna().to_numpy()
+            if (exp & okmask).any():
+                sims = {n: simulate_shift(fr, exp, n, S["frac"], S["base"], S["peak"], S["ef_exp"], S["ef_oth"]) for n in range(7)}
+                best_n = max(range(1, 7), key=lambda n: sims[n]["saving"])
+                b = sims[best_n]
+                tshare = float((exp & okmask).sum() / okmask.sum())
+                eshare = b["eligible_kwh"] / b["energy_base"] if b["energy_base"] > 0 else None
+                peak_hours = set(range(int(S["start"]), int(S["end"]))) if S["mode"] != MODE_STAT else set()
+                nonpeak = d[~d["hour"].isin(peak_hours)] if peak_hours else d
+                quiet = nonpeak.groupby("hour")["x"].mean().sort_values().head(4).index.tolist()
+                shift = {"best_hours": best_n, "saving": b["saving"], "saving_pct": b["saving_pct"],
+                         "shifted_kwh": b["shifted_kwh"], "eligible_kwh": b["eligible_kwh"],
+                         "energy_share": eshare, "time_share": tshare,
+                         "concentration": (eshare / tshare) if (eshare is not None and tshare > 0) else None,
+                         "savings_by_hours": {n: sims[n]["saving"] for n in range(7)},
+                         "sims": sims, "destination_hours": sorted(quiet)}
+        except Exception:
+            shift = None
+
+    # --- opportunities, ranked by value --------------------------------------------------
+    opps = []
+    ef = S["ef"]
+    if len(off) >= 12 and off_kwh > 0 and not pattern_flat:
+        k = IDLE_REDUCTION_ASSUMPTION * off_kwh
+        opps.append({"key": "idle", "title": "Cut idle / off-hours consumption", "type": "Energy reduction",
+                     "kwh": k, "rupees": money(k), "co2": k * ef,
+                     "evidence": f"{off_share:.0%} of all energy ({off_kwh:,.0f} {unit}) is used in hours that are normally quiet "
+                                 f"({hour_ranges(quiet_wk)} on weekdays). Quiet-hour load is {idle_ratio:.0%} of working-hour load; "
+                                 f"the always-on floor is about {base:.3g} per hour.",
+                     "assumption": f"{IDLE_REDUCTION_ASSUMPTION:.0%} of quiet-hour energy is avoidable with timers, auto-shutoff and standby control.",
+                     "action": "Walk the site in the quiet hours and list everything still running. Put lighting, HVAC, pumps and non-essential equipment on timers or auto-shutoff.",
+                     "verify": "Re-run the analysis after 2-4 weeks: the quiet-hour share and the always-on floor should fall."})
+    if shift and shift["saving"] > 0:
+        opps.append({"key": "shift", "title": f"Shift flexible load about {shift['best_hours']} h away from peak hours", "type": "Cost saving (timing only)",
+                     "kwh": 0.0, "rupees": shift["saving"], "co2": 0.0, "moved": shift["shifted_kwh"],
+                     "evidence": f"{shift['eligible_kwh']:,.0f} kWh ({shift['energy_share']:.0%} of energy) falls in the assumed peak window "
+                                 f"({S['start']:02d}:00-{S['end']:02d}:00). Moving {S['frac']:.0%} of it {shift['best_hours']} h later is the best of the 1-6 h options tested.",
+                     "assumption": f"Rates {inr(S['base'], 2)} normal / {inr(S['peak'], 2)} peak per kWh and {S['frac']:.0%} of peak-window energy movable "
+                                   f"({'your simulator inputs' if S['from_user'] else 'default assumptions, change them in the simulator'}).",
+                     "action": "Reschedule flexible loads (pumps, water heating, EV charging, batch processes, laundry) to start later; keep critical loads unchanged.",
+                     "verify": "Compare the peak-window kWh share and the time-of-day charges on the next bills against this baseline."})
+    if len(material) and events_excess > 0:
+        k = EVENT_AVOIDABLE_ASSUMPTION * events_excess
+        top = material.iloc[0]
+        opps.append({"key": "events", "title": "Investigate and prevent the largest unusual events", "type": "Energy reduction",
+                     "kwh": k, "rupees": money(k), "co2": k * ef,
+                     "evidence": f"{len(material)} material events used {events_excess:,.1f} {unit} more than expected. The largest began "
+                                 f"{top['start']:%a %d %b %H:%M}, lasted about {top['hours']:.0f} h and reached {top['ratio']:.1f}x the expected level.",
+                     "assumption": f"{EVENT_AVOIDABLE_ASSUMPTION:.0%} of the excess energy in these events is avoidable; some may be legitimate operations.",
+                     "action": "Start with the top three events: find out what operated at those times, then fix the cause or schedule it away from peaks.",
+                     "verify": "Re-run after the fix and compare the number of material events and total excess energy over a similar period."})
+    for o in opps:
+        o["confidence"] = conf
+        o["rupees_year"], o["kwh_year"] = year(o["rupees"]), year(o["kwh"])
+    opps.sort(key=lambda o: (o["rupees"] is None, -(o["rupees"] or 0.0), -o["kwh"]))
+    for i, o in enumerate(opps, 1):
+        o["rank"] = i
+
+    # --- transparent health score ---------------------------------------------------------
+    clip01 = lambda v: float(min(max(v, 0.0), 1.0))
+    comps = []
+    if load_factor is not None:
+        comps.append(("Load factor (average / peak)", f"{load_factor:.0%}", 100 * clip01((load_factor - 0.3) / 0.5),
+                      "30% scores 0, 80% or more scores 100"))
+    if idle_ratio is not None:
+        comps.append(("Quiet-hour load vs working-hour load", f"{idle_ratio:.0%}", 100 * clip01(1 - idle_ratio),
+                      "0% scores 100, 100% scores 0"))
+    if ml_ok and events_share is not None:
+        comps.append(("Excess energy in unusual events (share of total)", f"{events_share:.1%}", 100 * clip01(1 - events_share / 0.08),
+                      "0% scores 100, 8% or more scores 0"))
+    if shift and shift["concentration"] is not None:
+        comps.append(("Peak-window energy concentration", f"{shift['concentration']:.2f}x", 100 * clip01((1.6 - shift['concentration']) / 0.8),
+                      "0.8x or less scores 100, 1.6x or more scores 0"))
+    score = float(np.mean([c[2] for c in comps])) if comps else None
+    band = None if score is None else ("Good" if score >= 75 else ("Fair" if score >= 50 else "Needs attention"))
+
+    # --- headline sentences ------------------------------------------------------------------
+    head = []
+    if base_share is not None:
+        head.append(f"About {base_share:.0%} of everything consumed is the always-on floor (~{base:.3g} per hour) that never switches off.")
+    if off_share is not None and not pattern_flat and len(off):
+        head.append(f"{off_share:.0%} of energy is used in normally quiet hours ({hour_ranges(quiet_wk)} on weekdays).")
+    if opps and opps[0]["rupees"] is not None:
+        o = opps[0]
+        yr = f" (about {inr(o['rupees_year'])} a year if the period is typical)" if o["rupees_year"] else ""
+        head.append(f"Biggest opportunity: {o['title'].lower()}, roughly {inr(o['rupees'])} over the {span_days} days analysed{yr}.")
+    if len(material):
+        t = material.iloc[0]
+        head.append(f"Largest unusual event: {t['start']:%a %d %b %H:%M}, {t['ratio']:.1f}x the expected level, {t['excess']:,.1f} {unit} above normal.")
+
+    out.update({
+        "available": True, "has_kwh": has_kwh, "unit": unit, "span_days": span_days, "coverage": coverage,
+        "confidence": conf, "settings": S, "total": total, "mean": mean_x, "max": max_x, "peak_at": peak_at,
+        "load_factor": load_factor, "peak_to_avg": (max_x / mean_x if mean_x > 0 else None),
+        "base_load": base, "base_share": base_share,
+        "pattern_flat": pattern_flat, "profile": prof, "active": active,
+        "weekday_active": hour_ranges(wk_hours), "weekend_active": hour_ranges(we_hours) if we_hours else "none",
+        "quiet_weekday": hour_ranges(quiet_wk),
+        "off_kwh": off_kwh, "off_share": off_share, "idle_ratio": idle_ratio, "ghost_excess": ghost_excess,
+        "off_cost": money(off_kwh), "weekend_ratio": ratio_we, "night_day_ratio": night_day,
+        "daily": comp, "events": events, "material_events": material, "events_excess": events_excess,
+        "events_share": events_share, "events_basis": "ML anomalies" if ml_ok else "statistical peaks",
+        "shift": shift, "opportunities": opps, "score": score, "band": band, "score_parts": comps,
+        "headline": head, "frame_d": d})
+    return out
+
+
+def get_insights(item, res, show_ml):
+    """Compute once per change of data or settings and keep the result for the other pages."""
+    key = json.dumps([res.get("base_sig"), res.get("ml_sig"), str(item.get("meter") if item else None),
+                      bool(show_ml), sim_settings()], default=str, sort_keys=True)
+    cached = st.session_state.get("block5_insights")
+    if cached and cached[0] == key:
+        return cached[1]
+    ins = compute_insights(item, res, show_ml)
+    st.session_state["block5_insights"] = (key, ins)
+    return ins
+
+
+def insights_for_llm(ins):
+    """Compact, numeric summary of the insight engine for the language model (no raw rows)."""
+    if not ins.get("available"):
+        return {"available": False, "reason": ins.get("reason")}
+    S = ins["settings"]
+    ev = ins["material_events"]
+    return {
+        "available": True, "analysis_days": ins["span_days"], "data_confidence": ins["confidence"], "energy_unit": ins["unit"],
+        "load_shape": {"load_factor": ins["load_factor"], "peak_to_average_ratio": ins["peak_to_avg"],
+                       "always_on_floor_per_hour": ins["base_load"], "always_on_share_of_energy": ins["base_share"],
+                       "night_vs_daytime_load_ratio": ins["night_day_ratio"], "weekend_vs_weekday_daily_energy_ratio": ins["weekend_ratio"]},
+        "operating_pattern": {"flat": ins["pattern_flat"], "active_hours_weekday": ins["weekday_active"],
+                              "quiet_hours_weekday": ins["quiet_weekday"], "quiet_hour_energy_share": ins["off_share"],
+                              "quiet_hour_energy": ins["off_kwh"], "quiet_vs_working_load_ratio": ins["idle_ratio"],
+                              "note": "Hours are INFERRED from the typical load pattern, not confirmed by the user."},
+        "unusual_events": {"basis": ins["events_basis"], "material_event_count": int(len(ev)),
+                           "excess_energy_in_material_events": ins["events_excess"],
+                           "top_events": [{"start": str(r.start), "hours": r.hours, "peak_vs_expected": r.ratio,
+                                           "excess_energy": r.excess, "estimated_cost_inr": r.cost}
+                                          for r in ev.head(5).itertuples()]},
+        "abnormal_days": [{"date": str(i.date()), "energy": float(r.kwh), "typical_for_day_type": float(r.expected)}
+                          for i, r in ins["daily"][ins["daily"]["abnormal"]].head(3).iterrows()],
+        "assumptions": {"normal_rate_inr_per_kwh": S["base"], "peak_rate_inr_per_kwh": S["peak"],
+                        "peak_window": f"{S['start']:02d}:00-{S['end']:02d}:00, days {[DAY_NAMES[d] for d in S['days']]}",
+                        "rates_set_by_user": S["from_user"], "idle_avoidable_share": IDLE_REDUCTION_ASSUMPTION,
+                        "event_avoidable_share": EVENT_AVOIDABLE_ASSUMPTION, "emissions_factor_kg_per_kwh": S["ef"]},
+        "ranked_opportunities": [{"rank": o["rank"], "title": o["title"], "type": o["type"],
+                                  "energy_saved_kwh_in_period": o["kwh"], "energy_moved_kwh_in_period": o.get("moved"),
+                                  "estimated_saving_inr_in_period": o["rupees"], "estimated_saving_inr_per_year_if_typical": o["rupees_year"],
+                                  "co2_kg_in_period": o["co2"], "confidence": o["confidence"],
+                                  "evidence": o["evidence"], "assumption": o["assumption"]} for o in ins["opportunities"]],
+        "health_score": {"score": ins["score"], "band": ins["band"],
+                         "parts": [{"indicator": c[0], "value": c[1], "score": c[2]} for c in ins["score_parts"]]}}
+
+
+# ---- charts -------------------------------------------------------------------------------
+def build_profile_chart(ins):
+    prof, colors = ins["profile"], {"Weekday": "#527FA3", "Weekend": "#C8755D"}
+    fig = go.Figure()
+    t0 = "Weekday" if "Weekday" in ins["active"] else next(iter(ins["active"]), None)
+    if t0 and not ins["pattern_flat"]:
+        for h, a in ins["active"][t0].items():
+            if not a:
+                fig.add_vrect(x0=h - 0.5, x1=h + 0.5, fillcolor="rgba(200,117,93,0.12)", line_width=0, layer="below")
+    for t in prof.columns:
+        fig.add_trace(go.Scatter(x=list(prof.index), y=prof[t], mode="lines+markers", name=f"Typical {t.lower()}",
+                                 line=dict(color=colors.get(t, "#527FA3"), width=2)))
+    fig.add_hline(y=ins["base_load"], line_dash="dash", line_color="#355D7A",
+                  annotation_text="Always-on floor", annotation_position="bottom right")
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Hour of day (start of hour)",
+                      yaxis_title=f"Typical use per hour ({ins['unit']})", legend=dict(orientation="h", y=1.1))
+    fig.update_xaxes(tickmode="array", tickvals=list(range(0, 24, 2)), ticktext=[f"{h:02d}:00" for h in range(0, 24, 2)])
+    return fig
+
+
+def build_daily_chart(ins):
+    c = ins["daily"]
+    fig = go.Figure(go.Bar(x=c.index, y=c["kwh"], name=f"Daily energy ({ins['unit']})",
+                           marker_color=["#C8755D" if a else "#527FA3" for a in c["abnormal"]]))
+    fig.add_trace(go.Scatter(x=c.index, y=c["expected"], mode="lines", name="Typical for that day type",
+                             line=dict(color="#355D7A", dash="dash")))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title=f"Energy per day ({ins['unit']})",
+                      legend=dict(orientation="h", y=1.1))
+    return fig
+
+
+def build_gauge(value, title, suffix="/100"):
+    fig = go.Figure(go.Indicator(mode="gauge+number", value=value, number={"suffix": suffix},
+                                 title={"text": title},
+                                 gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#355D7A"},
+                                        "steps": [{"range": [0, 50], "color": "#E9C9BE"}, {"range": [50, 75], "color": "#E8DCC8"},
+                                                  {"range": [75, 100], "color": "#CFE0EC"}]}))
+    fig.update_layout(height=250, margin=dict(l=20, r=20, t=60, b=10))
+    return fig
+
+
+# ---- renderers -----------------------------------------------------------------------------
+def render_opportunity_table(ins, key):
+    opps = ins["opportunities"]
+    if not opps:
+        st.info("No quantified opportunity was found in this data. That can mean the load is already efficient, the pattern is flat, "
+                "or the data is too short. Check Data Quality and the Peak & Anomaly page.")
+        return
+    rows = [{"Rank": o["rank"], "Opportunity": o["title"], "Type": o["type"],
+             "Estimated value (period)": inr(o["rupees"]) if o["rupees"] is not None else "needs kWh data",
+             "Per year if typical": inr(o["rupees_year"]) if o["rupees_year"] else "n/a",
+             "Energy saved (kWh)": f"{o['kwh']:,.0f}" if o["kwh"] else f"{o.get('moved', 0):,.0f} moved",
+             "CO2e avoided (kg)": f"{o['co2']:,.0f}" if o["co2"] else "-", "Confidence": o["confidence"]} for o in opps]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Values are estimates for the data period under the stated assumptions. Opportunities can overlap, so do not simply add them up. "
+               "Annual figures appear only when at least 7 days of data are available.")
+    for o in opps:
+        with st.expander(f"#{o['rank']} {o['title']}"):
+            st.markdown(f"**Why:** {o['evidence']}\n\n**Assumption:** {o['assumption']}\n\n"
+                        f"**What to do:** {o['action']}\n\n**How to check it worked:** {o['verify']}")
+
+
+def render_headline_insights(item, res, show_ml):
+    """Overview: health score, key ratios, ranked opportunities and abnormal days."""
+    ins = get_insights(item, res, show_ml)
+    st.markdown("### Key insights")
+    if not ins["available"]:
+        st.info(ins["reason"])
+        return
+    c1, c2 = st.columns([1, 2])
+    if ins["score"] is not None:
+        c1.plotly_chart(build_gauge(ins["score"], "Energy Health Score"), use_container_width=True, key="ov_gauge")
+        c1.caption(f"{ins['band']}. A transparent indicator built from the checks listed on the Recommendations page; not a certified rating.")
+    with c2:
+        m = st.columns(2)
+        m[0].metric("Load factor", f"{ins['load_factor']:.0%}" if ins["load_factor"] is not None else "n/a",
+                    help="Average load divided by peak load. Higher means a flatter, more efficient profile; low means expensive, spiky demand.")
+        m[1].metric("Always-on floor", f"{ins['base_load']:.3g} / h", help="The typical lowest sustained load: what the site uses even when quiet.")
+        m = st.columns(2)
+        m[0].metric("Energy in quiet hours", f"{ins['off_share']:.0%}" if (ins["off_share"] is not None and not ins["pattern_flat"]) else "n/a",
+                    help="Share of energy used in hours that are normally quiet, inferred from the typical daily pattern in your data.")
+        top = ins["opportunities"][0] if ins["opportunities"] else None
+        m[1].metric("Top opportunity", inr(top["rupees"]) if top and top["rupees"] is not None else "n/a",
+                    help=(top["title"] + f" (over {ins['span_days']} days)") if top else "No quantified opportunity yet.")
+    for line in ins["headline"]:
+        st.markdown(f"- {line}")
+    st.markdown("#### Ranked opportunities")
+    render_opportunity_table(ins, "ov")
+    st.markdown("#### Daily energy and abnormal days")
+    st.plotly_chart(build_daily_chart(ins), use_container_width=True, key="ov_daily")
+    ab = ins["daily"][ins["daily"]["abnormal"]]
+    if len(ab):
+        st.caption("Terracotta bars are days well above what is typical for that type of day (weekday/weekend): "
+                   + ", ".join(f"{i:%d %b} ({r.kwh:,.0f} {ins['unit']}, {(r.kwh / r.expected - 1):+.0%})" for i, r in ab.head(5).iterrows()) + ".")
+    else:
+        st.caption("No day stands out strongly from its day type.")
+
+
+def render_event_insights(item, res, show_ml):
+    ins = get_insights(item, res, show_ml)
+    st.markdown("### What matters most: unusual events ranked by energy above normal")
+    if not ins["available"]:
+        st.info(ins["reason"])
+        return
+    mat = ins["material_events"]
+    basis = ins["events_basis"]
+    if basis == "statistical peaks":
+        st.info("Anomaly detection has not been run, so events below are based on statistical peaks. Run the analysis with anomaly detection for a sharper list.")
+    if not len(mat):
+        st.success("No material event stands out: flagged points are close to what is normal for their hour and weekday.")
+        return
+    m = st.columns(4)
+    m[0].metric("Material events", f"{len(mat):,}", help=f"Groups of consecutive flagged hours whose peak is at least {MATERIAL_EVENT_RATIO:.2f}x the expected level.")
+    m[1].metric(f"Energy above normal ({ins['unit']})", f"{ins['events_excess']:,.1f}")
+    m[2].metric("Estimated cost of that excess", inr(ins["events_excess"] * ins["settings"]["base"]) if ins["has_kwh"] else "n/a")
+    m[3].metric("Share of total energy", f"{ins['events_share']:.1%}" if ins["events_share"] is not None else "n/a")
+    t = mat.iloc[0]
+    st.write(f"The biggest event began **{t['start']:%A %d %b at %H:%M}**, lasted about **{t['hours']:.0f} h**, peaked at **{t['peak']:.3g}** "
+             f"against an expected **{t['expected']:.3g}** ({t['ratio']:.1f}x), adding **{t['excess']:,.1f} {ins['unit']}** above normal. "
+             f"Expected values come from the median of the same weekday and hour on other days.")
+    tab = pd.DataFrame({"Start": mat["start"].dt.strftime("%a %d %b %H:%M"), "Hours": mat["hours"].round(1),
+                        "Peak": mat["peak"].map(lambda v: f"{v:.3g}"), "Expected": mat["expected"].map(lambda v: f"{v:.3g}"),
+                        "x Expected": mat["ratio"].map(lambda v: f"{v:.1f}x" if pd.notna(v) else "n/a"),
+                        f"Excess ({ins['unit']})": mat["excess"].round(1),
+                        "Est. cost": mat["cost"].map(lambda v: inr(v) if v is not None and pd.notna(v) else "n/a"),
+                        "What to check (hypothesis)": mat["check"]}).head(10)
+    st.dataframe(tab, use_container_width=True, hide_index=True)
+    st.caption("An anomaly detector flags roughly the share of readings set by its sensitivity setting, so the count alone says little. "
+               "Ranking by energy above normal shows which events are worth an investigation. 'What to check' lists hypotheses, not diagnoses.")
+    st.markdown("#### Daily energy and abnormal days")
+    st.plotly_chart(build_daily_chart(ins), use_container_width=True, key="pk_daily")
+
+
+def render_offhours_insights(item, res, show_ml, kp):
+    """Ghost load: quantified from the pattern in the data, no schedule input needed."""
+    st.divider()
+    st.subheader("Ghost load: use outside the normal operating pattern")
+    st.caption("EnergyIQ learns when the site is normally active from the typical hourly pattern in your data, so nothing has to be entered. "
+               "Confirm with real site activity before acting: security, refrigeration and servers may legitimately run all night.")
+    ins = get_insights(item, res, show_ml)
+    if not ins["available"]:
+        st.info(ins["reason"])
+        return
+    u = ins["unit"]
+    if ins["pattern_flat"]:
+        st.info("The load is almost flat across the day, so quiet hours cannot be separated by timing. This usually means a 24/7 operation. "
+                "Focus on the always-on floor: reducing it by even 5-10% applies to every hour.")
+    m = st.columns(4)
+    m[0].metric("Normally active (weekdays)", ins["weekday_active"],
+                help="Weekends: " + ("quiet all day" if ins["weekend_active"] == "none" else ins["weekend_active"]))
+    m[1].metric("Always-on floor", f"{ins['base_load']:.3g} / h", help="Median of the lowest 3-hour average of each day.")
+    m[2].metric("Energy in quiet hours", f"{ins['off_kwh']:,.0f} {u}" + (f" ({ins['off_share']:.0%})" if ins["off_share"] is not None else ""))
+    m[3].metric("Quiet vs working-hour load", f"{ins['idle_ratio']:.0%}" if ins["idle_ratio"] is not None else "n/a",
+                help="Average load in quiet hours divided by average load in active hours. Lower is better.")
+    m = st.columns(4)
+    m[0].metric("Above the floor in quiet hours", f"{ins['ghost_excess']:,.0f} {u}", help="Energy in quiet hours that exceeds the always-on floor: looks discretionary.")
+    m[1].metric("Cost of quiet-hour energy", inr(ins["off_cost"]) if ins["off_cost"] is not None else "n/a")
+    m[2].metric("Weekend vs weekday daily use", f"{ins['weekend_ratio']:.0%}" if ins["weekend_ratio"] is not None else "n/a")
+    m[3].metric("Night vs daytime load", f"{ins['night_day_ratio']:.0%}" if ins["night_day_ratio"] is not None else "n/a",
+                help="Average load 00:00-06:00 divided by average load 08:00-18:00.")
+    st.plotly_chart(build_profile_chart(ins), use_container_width=True, key=kp("pf_fig"))
+    st.caption("Shaded hours are inferred quiet hours. The dashed line is the always-on floor. A big gap between the lines and the floor at night is ghost load.")
+    if ins["off_kwh"] > 0 and not ins["pattern_flat"]:
+        st.markdown("**What if quiet-hour consumption were reduced?**")
+        rows = []
+        for p in (0.10, 0.20, 0.30, 0.50):
+            k = p * ins["off_kwh"]
+            rows.append({"Reduction in quiet-hour energy": f"{p:.0%}", f"Energy saved ({u})": round(k, 1),
+                         "Estimated saving": inr(k * ins["settings"]["base"]) if ins["has_kwh"] else "n/a",
+                         "Per year if typical": inr(k * ins["settings"]["base"] * 365 / ins["span_days"]) if (ins["has_kwh"] and ins["span_days"] >= 7) else "n/a",
+                         "CO2e avoided (kg)": round(k * ins["settings"]["ef"], 0)})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(f"Rate used: {inr(ins['settings']['base'], 2)} per kWh. Reduction levels are scenarios, not forecasts.")
+        st.markdown("**What to do next**")
+        st.markdown(f"- Visit the site during {ins['quiet_weekday']} and list what is still on.\n"
+                    "- Put lighting, HVAC and non-essential machines on timers; keep refrigeration, security and servers.\n"
+                    "- Compare the weekend profile with the weekday one: a weekend that is not much lower points to equipment left running.")
+
+
+def render_shift_recommendation(item, res, show_ml, kp):
+    ins = get_insights(item, res, show_ml)
+    st.markdown("### Best shift for these settings")
+    sh = ins.get("shift") if ins["available"] else None
+    if not sh:
+        st.info("A shift recommendation needs hourly energy data in kWh and some usage inside the peak window.")
+        return
+    S = ins["settings"]
+    if not S["from_user"]:
+        st.caption("Set the rates and peak window above to see recommendations based on your own inputs; defaults are used until then.")
+    m = st.columns(3)
+    m[0].metric("Best delay tested (1-6 h)", f"{sh['best_hours']} h")
+    m[1].metric("Estimated saving at that delay", inr(sh["saving"]), help=f"Over the {ins['span_days']} days analysed.")
+    m[2].metric("Per year if typical", inr(sh["saving"] * 365 / ins["span_days"]) if ins["span_days"] >= 7 else "n/a")
+    fig = go.Figure(go.Bar(x=[f"{n} h" for n in range(7)], y=[sh["savings_by_hours"][n] for n in range(7)],
+                           marker_color=["#C8755D" if n == sh["best_hours"] else "#527FA3" for n in range(7)]))
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Delay applied to peak-window load",
+                      yaxis_title="Estimated saving (₹)")
+    st.plotly_chart(fig, use_container_width=True, key=kp("best_shift_fig"))
+    if sh["destination_hours"]:
+        st.write("Lowest-demand hours outside the peak window, good candidates for moving flexible work into: "
+                 f"**{hour_ranges(sh['destination_hours'])}**.")
+
+
+def render_solar_alignment(item, res, show_ml, kp):
+    """Green Sync score: how well the load follows an assumed solar-availability curve."""
+    st.divider()
+    st.markdown("### Solar alignment (Green Sync score)")
+    st.caption("ASSUMED CURVE, NOT GRID DATA: solar availability is modelled as a sine curve from 06:00 to 18:00 peaking at 12:00. "
+               "The score is the energy-weighted average availability of when you consume, 0-100%.")
+    ins = get_insights(item, res, show_ml)
+    if not ins["available"]:
+        st.info(ins["reason"])
+        return
+    d = ins["frame_d"]
+    av = np.array([solar_availability(h) for h in range(24)])
+    base_score = 100 * float((d["x"] * av[d["hour"].to_numpy()]).sum() / d["x"].sum()) if d["x"].sum() > 0 else None
+    solar_share = float(d.loc[(d["hour"] >= 9) & (d["hour"] < 16), "x"].sum() / d["x"].sum()) if d["x"].sum() > 0 else None
+    sh, shifted_score = ins.get("shift"), None
+    if sh:
+        sim = sh["sims"][sh["best_hours"]]["sim"]
+        hrs = item["frame"]["timestamp"].dt.hour.to_numpy()
+        ok = np.isfinite(sim)
+        if sim[ok].sum() > 0:
+            shifted_score = 100 * float((sim[ok] * av[hrs[ok]]).sum() / sim[ok].sum())
+    c1, c2 = st.columns(2)
+    if base_score is not None:
+        c1.plotly_chart(build_gauge(base_score, "Green Sync Score now", "%"), use_container_width=True, key=kp("gs_now"))
+    if shifted_score is not None:
+        c2.plotly_chart(build_gauge(shifted_score, f"After the cost shift ({sh['best_hours']} h later)", "%"), use_container_width=True, key=kp("gs_after"))
+    m = st.columns(2)
+    m[0].metric("Energy used in 09:00-16:00", f"{solar_share:.0%}" if solar_share is not None else "n/a")
+    m[1].metric("Best hours for flexible load", "10:00-15:00", help="Hours with the highest assumed solar availability.")
+    if shifted_score is not None and base_score is not None and shifted_score < base_score - 0.5:
+        st.warning("Delaying load to avoid peak tariffs moves it later in the day, away from solar hours, so cost and solar goals pull in opposite directions here. "
+                   "Where flexible load can instead run earlier, in 10:00-15:00, it helps both.")
+    st.caption("To use real data, replace the assumed curve with your supplier's or grid operator's hourly renewable share.")
+
+
+def render_action_plan(result, ctx):
+    """Recommendations: the calculated action plan (no AI) plus an executive e-mail draft."""
+    if not isinstance(ctx, dict):
+        return
+    item, res, show_ml = ctx["item"], ctx["res"], ctx["show_ml"]
+    ins = get_insights(item, res, show_ml)
+    st.markdown("### Calculated action plan")
+    st.caption("Everything in this section is computed from your data with fixed, visible rules. No language model is involved.")
+    if not ins["available"]:
+        st.info(ins["reason"])
+        return
+    c1, c2 = st.columns([1, 2])
+    if ins["score"] is not None:
+        c1.plotly_chart(build_gauge(ins["score"], "Energy Health Score"), use_container_width=True, key="rec_gauge")
+    with c2:
+        if ins["score_parts"]:
+            st.dataframe(pd.DataFrame([{"Indicator": c[0], "Your value": c[1], "Score": round(c[2]), "How it is scored": c[3]}
+                                       for c in ins["score_parts"]]), use_container_width=True, hide_index=True)
+        st.caption(f"Data confidence: {ins['confidence']} ({ins['span_days']} days, {ins['coverage']:.0%} of hours valid). "
+                   "Short or patchy data lowers confidence.")
+    render_opportunity_table(ins, "rec")
+    with st.expander("Executive e-mail draft (generated without AI)"):
+        text = build_exec_email(result, ctx, ins)
+        st.text(text)
+        st.download_button("Download e-mail draft", text.encode("utf-8"), file_name="energyiq_exec_email.txt", mime="text/plain", key="dl_exec_email")
+
+
+def build_exec_email(result, ctx, ins):
+    item = ctx["item"]
+    scope = "the site" if item.get("meter") is None else f"meter/zone {clean_text(item['meter'])}"
+    s = item["summary"]
+    period = f"{pd.Timestamp(s['start']):%d %b %Y} to {pd.Timestamp(s['end']):%d %b %Y}"
+    opps = ins["opportunities"]
+    tot = sum(o["rupees"] for o in opps if o["rupees"] is not None)
+    subj = (f"EnergyIQ review: about {inr(tot)} of estimated opportunity identified ({period})" if tot else f"EnergyIQ review ({period})")
+    L = [f"Subject: {subj}", "", "Hello team,", "",
+         f"EnergyIQ analysed {ins['span_days']} days of electricity data for {scope} ({period}).", ""]
+    if ins["has_kwh"]:
+        L.append(f"- Total energy: {ins['total']:,.0f} kWh, about {inr(ins['total'] * ins['settings']['base'])} at an assumed {inr(ins['settings']['base'], 2)} per kWh.")
+    if ins["score"] is not None:
+        L.append(f"- Energy Health Score: {ins['score']:.0f}/100 ({ins['band']}).")
+    if ins["base_share"] is not None:
+        L.append(f"- Always-on floor: about {ins['base_load']:.3g} per hour, {ins['base_share']:.0%} of all consumption.")
+    if ins["off_share"] is not None and not ins["pattern_flat"]:
+        L.append(f"- {ins['off_share']:.0%} of energy is used in normally quiet hours ({ins['quiet_weekday']} on weekdays).")
+    L += ["", "Recommended actions (estimates under stated assumptions, ranked by value):"]
+    for o in opps:
+        v = inr(o["rupees"]) if o["rupees"] is not None else "n/a"
+        L.append(f"{o['rank']}. {o['title']} - about {v} over the period. {o['action']}")
+        L.append(f"   Check: {o['verify']}")
+    if not opps:
+        L.append("No quantified opportunity was found with the current data.")
+    L += ["", f"Confidence: {ins['confidence']}. Figures are estimates, not bills or guaranteed savings; unusual readings are prompts to investigate, not proof of faults.",
+          "", "Regards,", "EnergyIQ"]
+    return "\n".join(L)
+
+
+def render_grounding_check(text, evidence_json):
+    """Flag numbers in AI text that do not appear in the evidence it was given."""
+    ev_nums = []
+    for n in re.findall(r"\d[\d,]*\.?\d*", evidence_json):
+        try:
+            ev_nums.append(float(n.replace(",", "").rstrip(".")))
+        except ValueError:
+            pass
+    found = []
+    for n in re.findall(r"\d[\d,]*\.?\d*", text):
+        raw = n.replace(",", "").rstrip(".")
+        try:
+            v = float(raw)
+        except ValueError:
+            continue
+        if v < 100 and "." not in raw:
+            continue
+        if not any(abs(v - e) <= max(0.02 * abs(e), 0.51) for e in ev_nums):
+            found.append(n.rstrip("."))
+    if found:
+        st.warning("Automatic check: these numbers in the AI text were not found in the evidence it was given. Verify them before use: "
+                   + ", ".join(sorted(set(found))[:8]))
+    else:
+        st.caption("Automatic check: every figure of 100 or more in the AI text matches the evidence it was given.")
+
+
+# block 5 : ai report
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"   # override with GROQ_MODEL; check console.groq.com/docs/models
 GROQ_TIMEOUT_S = 45.0
 GROQ_MAX_TOKENS = 3000
@@ -1510,7 +2124,9 @@ RULES
    [Hypothesis] a possible explanation that still has to be tested.
 4. Never claim that a particular appliance or piece of equipment caused a spike. Never say an anomaly proves equipment failure. Never call a statistical peak an expensive or tariff period unless the evidence says the user confirmed a tariff window. Never promise a specific monetary saving; simulated figures may only be quoted as scenario estimates under their stated assumptions. Never claim actual carbon reduction from the simulated renewable-share dial or from placeholder emission factors. Never treat missing readings as zero consumption.
 5. If the evidence does not establish a cause, recommend an investigation instead of asserting one. If a metric is listed as unavailable, say so and do not estimate it. If data coverage or quality is limited, make one of the steps about improving measurement or resolving the data-quality issue.
-6. Prioritise device/appliance/meter-specific findings when the evidence contains device_comparison: name the highest-use device(s), cite measured totals or peak/anomaly counts, and suggest a targeted check for those device(s). If device-level identifiers are absent, explicitly say the data only supports whole-meter conclusions and recommend collecting submeter/appliance readings; do not invent appliance names. Generic advice such as “analyse readings” is insufficient when device-level evidence exists. Be concise, professional and understandable to a non-expert. Each field is one to three sentences.
+6. Be concise, professional and understandable to a non-expert. Each field is one to three sentences.
+7. The evidence contains data_driven_insights.ranked_opportunities, already calculated and ranked by value. Base the three steps on the highest-ranked opportunities. Quote their amounts exactly as given and describe every rupee figure as an estimate for the data period under the stated assumptions. Never add up opportunities as if they were independent and never invent a figure that is not in the evidence.
+8. Operating and quiet hours in the evidence are INFERRED from the typical load pattern, not confirmed by the user. Say so when you use them.
 
 OUTPUT FORMAT (follow exactly, in Markdown)
 Return exactly three numbered mitigation steps, numbered 1, 2 and 3, and nothing before step 1. Use this layout:
@@ -1627,30 +2243,6 @@ def build_evidence(item, res, show_ml, rep, cfg):
                    "note": "Statistical peaks are relative to this dataset only. They are not tariff periods."})
     ev["statistical_peaks"] = sp
 
-    # Include per-meter evidence when each meter is separately represented in the analysis.
-    device_rows = []
-    for series_item in res.get("series", []):
-        try:
-            meter_name = series_item.get("meter")
-            sm = series_item.get("summary", {})
-            if meter_name is not None:
-                device_rows.append({
-                    "appliance_or_meter": clean_text(meter_name),
-                    "total_energy_kwh": num(sm.get("total_energy")),
-                    "mean_reading": num(sm.get("mean")),
-                    "peak_reading": num(sm.get("max")),
-                    "peak_count": int(sm.get("n_peaks", 0)),
-                    "valid_points": int(sm.get("n_valid", 0)),
-                })
-        except Exception:
-            continue
-    if device_rows:
-        ev["device_comparison"] = sorted(
-            device_rows,
-            key=lambda x: x["total_energy_kwh"] if x["total_energy_kwh"] is not None else -1,
-            reverse=True
-        )[:10]
-
     # anomalies
     an = {"method": "IsolationForest", "contamination_setting": item["ml"]["contamination"] if item["ml"] else None}
     if show_ml and item["ml"]:
@@ -1669,11 +2261,30 @@ def build_evidence(item, res, show_ml, rep, cfg):
         unavailable.append("Anomaly detection has not been run for the current settings.")
     ev["anomalies"] = an
 
-    off = st.session_state.get("block3_offhours") or {"available": False, "reason": "Off-hours analysis was not produced for this scope."}
-    ev["off_hours"] = off
-    if not off.get("available"):
-        unavailable.append("Off-hours analysis: " + str(off.get("reason")))
-    sim = st.session_state.get("block4_summary") or {"available": False, "reason": "The simulator was not produced for this scope."}
+    ins = get_insights(item, res, show_ml)
+    ev["data_driven_insights"] = insights_for_llm(ins)
+    if ins["available"]:
+        ev["off_hours"] = {"available": not ins["pattern_flat"], "inferred_from_data_not_confirmed_by_user": True,
+                           "details": "see data_driven_insights.operating_pattern"}
+        if ins["pattern_flat"]:
+            unavailable.append("Quiet-hour analysis: the load is almost flat across the day, so no working pattern could be inferred.")
+    else:
+        ev["off_hours"] = {"available": False, "reason": ins["reason"]}
+        unavailable.append("Data-driven insights: " + str(ins["reason"]))
+    sim = st.session_state.get("block4_summary")
+    if not (sim and sim.get("available")):
+        sh = ins.get("shift") if ins["available"] else None
+        if sh:
+            S = ins["settings"]
+            sim = {"available": True, "scenario_type": "Default assumptions (not set by the user in the simulator)",
+                   "is_user_confirmed_tariff": False, "currency": "INR",
+                   "expensive_periods": f"{[DAY_NAMES[d] for d in S['days']]} {S['start']:02d}:00-{S['end']:02d}:00",
+                   "shift_hours": sh["best_hours"], "assumed_shiftable_fraction_pct": S["frac"] * 100,
+                   "baseline_price_per_kwh": S["base"], "expensive_period_price_per_kwh": S["peak"],
+                   "estimated_saving": sh["saving"], "simulated_as_shifted_kwh": sh["shifted_kwh"],
+                   "note": "Best delay of 1-6 h under default placeholder assumptions; not a bill and not a guaranteed saving."}
+        else:
+            sim = {"available": False, "reason": "No energy-shifting scenario could be produced for this scope."}
     ev["energy_shift_simulation"] = sim
     if not sim.get("available"):
         unavailable.append("Energy-shifting simulation: " + str(sim.get("reason")))
@@ -1690,17 +2301,18 @@ def assess_evidence(ev):
     if ev is None:
         return "Insufficient", []
     dq, sp, an = ev["data_quality"], ev["statistical_peaks"], ev["anomalies"]
-    sim, off = ev["energy_shift_simulation"], ev["off_hours"]
+    sim, di = ev["energy_shift_simulation"], ev.get("data_driven_insights", {})
     vf = dq["valid_fraction"] or 0
+    pattern_ok = bool(di.get("available") and not di.get("operating_pattern", {}).get("flat"))
     checks = [
         ("At least 24 valid analysis points", dq["valid_analysis_points"] >= 24, f"{dq['valid_analysis_points']} valid points"),
         ("Good coverage (at least 80% of analysis points valid)", vf >= 0.8, f"{vf:.0%} valid"),
         ("Statistical peak threshold calculated", sp.get("status") == "calculated", sp.get("status", "")[:80]),
         ("Anomaly detection run", an.get("status") == "calculated", an.get("status", "")[:80]),
         ("Energy (kWh) quantities available", ev["consumption"]["total_energy_kwh"] is not None, "needed for energy, cost and carbon figures"),
-        ("Operating schedule confirmed by you", bool(off.get("available") and off.get("schedule_configured_by_user")),
-         "off-hours results are only 'potential' with the presumed schedule" if off.get("available") else str(off.get("reason", ""))[:80]),
-        ("Energy-shifting simulation available", bool(sim.get("available")), "" if sim.get("available") else str(sim.get("reason", ""))[:80])]
+        ("Normal operating pattern identified from the data", pattern_ok,
+         "quiet hours are inferred, not confirmed" if pattern_ok else "no clear daily pattern or too little data"),
+        ("Energy-shifting scenario available", bool(sim.get("available")), "" if sim.get("available") else str(sim.get("reason", ""))[:80])]
     if not checks[0][1]:
         return "Insufficient", checks
     return ("Sufficient" if all(c[1] for c in checks) else "Limited"), checks
@@ -1799,10 +2411,123 @@ def call_groq(evidence_json, api_key, model):
     return None, f"The model returned a malformed report ({problem}). No report was accepted.", raw
 
 
+def _basic_findings(result, ctx):
+    """Observation-level findings: largest reading, flagged readings, busiest flagged hour, context association."""
+    findings = []
+    if not isinstance(ctx, dict) or not ctx.get("item") or not ctx.get("res"):
+        return findings, pd.DataFrame()
+    item, res = ctx["item"], ctx["res"]
+    frame = item.get("frame", pd.DataFrame()).copy()
+    if frame.empty or "value" not in frame:
+        return findings, pd.DataFrame()
+    valid = frame[frame["value"].notna()].copy()
+    if valid.empty:
+        return findings, pd.DataFrame()
+    unit = res.get("info", {}).get("unit_out", "unknown")
+    # Explain the actual observed peak and how it compares with the typical level.
+    peak = valid.loc[valid["value"].idxmax()]
+    med = float(valid["value"].median())
+    if med:
+        ratio = float(peak["value"]) / abs(med)
+        findings.append({"Priority":"High" if ratio >= 2 else "Medium",
+            "Finding":"Largest observed reading",
+            "Evidence":f"{peak['timestamp']} recorded {peak['value']:.4g} {unit}; {ratio:.2f}× the median reading ({med:.4g} {unit}).",
+            "Recommended next step":f"Inspect the meter/log for {peak['timestamp']} and compare the same hour on nearby days. If this is a real operating event, identify the scheduled activity; if not, validate the sensor/entry.",
+            "How to verify":"Compare the same-hour readings before/after the event and check whether the peak repeats."})
+    # Use flagged event evidence already computed by the existing analysis pipeline.
+    flags = valid.copy()
+    for c in ("statistical_peak", "ml_anomaly"):
+        if c not in flags: flags[c] = False
+    flagged = flags[flags["statistical_peak"].astype(bool) | flags["ml_anomaly"].astype(bool)]
+    if len(flagged):
+        findings.append({"Priority":"High" if len(flagged) / max(1,len(valid)) >= .1 else "Medium",
+            "Finding":"Repeated high or unusual readings",
+            "Evidence":f"{len(flagged):,} of {len(valid):,} valid points ({len(flagged)/len(valid):.1%}) were flagged by the existing percentile/IsolationForest checks.",
+            "Recommended next step":"Start with the highest-valued flagged events, then group them by hour and weekday. Check schedules, start-up cycles and meter quality for those exact windows; do not assume a flag proves equipment failure.",
+            "How to verify":"After an operational change or data correction, rerun the analysis and compare flagged-event count and peak magnitude over an equivalent period."})
+        if "hour" in flagged:
+            by_hour = flagged.assign(_hour=flagged["timestamp"].dt.hour).groupby("_hour").size().sort_values(ascending=False)
+            if len(by_hour):
+                h, n = int(by_hour.index[0]), int(by_hour.iloc[0])
+                findings.append({"Priority":"Medium","Finding":"Most frequent flagged hour",
+                    "Evidence":f"{n} flagged readings occurred at {h:02d}:00, the most frequent hour in this selected scope.",
+                    "Recommended next step":f"Review activities that routinely run around {h:02d}:00 and compare weekdays with weekends before changing schedules.",
+                    "How to verify":"Compare the flagged count for this hour across matched days before and after any change."})
+    # Context associations are observational, not causal.
+    clean = result.get("clean") if isinstance(result, dict) else None
+    rep = result.get("report", {}) if isinstance(result, dict) else {}
+    ctx_cols = rep.get("context_columns", [])
+    context_rows = []
+    if isinstance(clean, pd.DataFrame) and ctx_cols:
+        energy_name = res.get("name")
+        info = rep.get("columns", {}).get(energy_name, {})
+        energy_col = info.get("energy_col")
+        if energy_col and energy_col in clean:
+            for col in ctx_cols:
+                pair = clean[[energy_col, col]].apply(pd.to_numeric, errors="coerce").dropna()
+                if len(pair) >= 10 and pair[energy_col].nunique() > 1 and pair[col].nunique() > 1:
+                    corr = pair[energy_col].corr(pair[col])
+                    if pd.notna(corr):
+                        context_rows.append({"Context variable":col.replace("context__", ""), "Paired readings":len(pair), "Correlation with energy":float(corr)})
+            if context_rows:
+                cdf = pd.DataFrame(context_rows).sort_values("Correlation with energy", key=lambda x:x.abs(), ascending=False)
+                top = cdf.iloc[0]
+                findings.append({"Priority":"Explore","Finding":"Energy/context relationship to investigate",
+                    "Evidence":f"'{top['Context variable']}' has Pearson correlation {top['Correlation with energy']:+.2f} with the selected energy series across {int(top['Paired readings'])} paired readings.",
+                    "Recommended next step":"Compare matched periods with similar occupancy/production and inspect the scatter/time plot. Correlation is a lead for investigation, not proof that the context variable caused energy use.",
+                    "How to verify":"Check whether the relationship persists by weekday/season and after accounting for operating hours."})
+    return findings, pd.DataFrame(context_rows)
+
+
+def build_local_insights(result, ctx):
+    """Findings table: quantified opportunities first, then observation-level findings."""
+    findings, context_df = _basic_findings(result, ctx)
+    quantified = []
+    if isinstance(ctx, dict):
+        ins = get_insights(ctx["item"], ctx["res"], ctx["show_ml"])
+        if ins.get("available"):
+            for o in ins["opportunities"]:
+                quantified.append({"Priority": "High" if o["rank"] == 1 else "Medium", "Finding": o["title"],
+                                   "Evidence": o["evidence"], "Recommended next step": o["action"],
+                                   "How to verify": o["verify"],
+                                   "Estimated impact": (inr(o["rupees"]) + f" over {ins['span_days']} days") if o["rupees"] is not None else "needs kWh data"})
+            if ins["weekend_ratio"] is not None and ins["weekend_ratio"] >= 0.9 and not ins["pattern_flat"]:
+                quantified.append({"Priority": "Medium", "Finding": "Weekend use is almost as high as weekday use",
+                                   "Evidence": f"Average weekend-day energy is {ins['weekend_ratio']:.0%} of an average weekday.",
+                                   "Recommended next step": "Check whether weekend operation is intended; if not, review timers and HVAC schedules for Saturday and Sunday.",
+                                   "How to verify": "Compare weekend vs weekday daily energy after the schedule change.", "Estimated impact": "-"})
+            ab = ins["daily"][ins["daily"]["abnormal"]]
+            if len(ab):
+                r = ab.sort_values("z", ascending=False).iloc[0]
+                quantified.append({"Priority": "Medium", "Finding": "Abnormal day",
+                                   "Evidence": f"{ab.sort_values('z', ascending=False).index[0]:%a %d %b} used {r['kwh']:,.0f} {ins['unit']}, {(r['kwh'] / r['expected'] - 1):+.0%} versus a typical {r['dt'].lower()}.",
+                                   "Recommended next step": "Find out what was different that day (production, events, weather, equipment).",
+                                   "How to verify": "Check whether similar days recur and compare their hourly profiles.", "Estimated impact": "-"})
+    for f in findings:
+        f.setdefault("Estimated impact", "-")
+    return quantified + findings, context_df
+
+
+def render_local_insights(result, ctx):
+    findings, context_df = build_local_insights(result, ctx)
+    st.markdown("### Findings from this dataset")
+    st.caption("These findings are calculated from the selected analysis scope. A statistical/model flag is a signal to investigate, not a diagnosis of cause.")
+    if findings:
+        st.dataframe(pd.DataFrame(findings), use_container_width=True, hide_index=True)
+    else:
+        st.info("Not enough valid readings are available to produce evidence-based findings yet.")
+    if not context_df.empty:
+        st.markdown("### Environmental / operational context")
+        st.caption("Only numeric columns whose names suggest context (such as temperature, humidity, occupancy or production) are included. Correlation does not establish causation.")
+        st.dataframe(context_df, use_container_width=True, hide_index=True)
+
+
 def render_report_section(result, ctx):
     """Compact, user-facing executive recommendations page."""
     st.subheader("Recommendations")
-    st.write("Generate three evidence-based actions from the current analysis. The uploaded CSV itself is not sent to the language model; only a compact summary of analysis results is used.")
+    st.write("Recommendations are grounded in the selected dataset. The uploaded CSV itself is not sent to the language model; only a compact summary of analysis results is used when AI reporting is configured.")
+    render_action_plan(result, ctx)
+    render_local_insights(result, ctx)
     evidence = None
     if isinstance(ctx, dict):
         try:
@@ -1826,6 +2551,8 @@ def render_report_section(result, ctx):
     ev_json = json.dumps(evidence, separators=(",", ":"), default=str).replace("<", "\\u003c")
     ev_sig = hashlib.md5(json.dumps(evidence, sort_keys=True, default=str).encode()).hexdigest()
     sig = st.session_state.get("cfg_sig", "")[:10]
+    st.markdown("### AI briefing (optional)")
+    st.caption("The plan above is already calculated. The AI only turns the same numbers into a short, three-step briefing in plain English.")
     clicked = st.button("Generate recommendations", type="primary", disabled=not api_key, key=f"b5_gen_{sig}")
     if not api_key:
         st.info("AI recommendations are not configured on this installation. The dashboard analysis, heatmap and simulator still work.")
@@ -1834,7 +2561,7 @@ def render_report_section(result, ctx):
         with st.spinner("Preparing recommendations…"):
             text, err, raw = call_groq(ev_json, api_key, model)
         if err:
-            st.error("Recommendations could not be generated. Please try again later or contact the app administrator.")
+            st.error(f"Recommendations could not be generated: {err}")
         else:
             st.session_state["block5_report"] = {"sig": ev_sig, "text": text, "model": model,
                                                   "at": datetime.now().strftime("%Y-%m-%d %H:%M")}
@@ -1843,13 +2570,12 @@ def render_report_section(result, ctx):
         st.markdown("### Recommended actions")
         st.markdown(saved["text"])
         st.caption("AI-generated recommendations are advisory. Check each claim against the measured data; simulated savings are not guaranteed.")
+        render_grounding_check(saved["text"], ev_json)
         st.download_button("Download recommendations", saved["text"].encode("utf-8"),
                            file_name="energyiq_recommendations.md", mime="text/markdown", key=f"b5_dl_{sig}")
 
 
-# ----------------------------------------------------------------------------
-# User-facing dashboard: upload once, then use the sidebar to navigate.
-# ----------------------------------------------------------------------------
+#user dashboard
 
 def infer_quick_config(raw, timestamp_col=None, measurement_col=None, measurement_type=None, unit=None, meter_col=None):
     """Build a sensible first-pass mapping while keeping units visible and editable."""
@@ -1903,76 +2629,6 @@ def get_energy_total(clean, rep, name):
     return float(vals.sum()) if vals.notna().any() else None
 
 
-def appliance_breakdown(clean, rep, selected_name):
-    """Summarise consumption and unusual readings by the dataset's meter/appliance identifier."""
-    if clean is None or "meter" not in clean.columns or clean["meter"].nunique(dropna=True) < 2:
-        return None
-    info = rep.get("columns", {}).get(selected_name, {})
-    energy_col = info.get("energy_col")
-    if not energy_col or energy_col not in clean.columns:
-        return None
-    frame = clean.copy()
-    frame[energy_col] = pd.to_numeric(frame[energy_col], errors="coerce")
-    frame[selected_name] = pd.to_numeric(frame[selected_name], errors="coerce")
-    rows = []
-    for meter, group in frame.groupby("meter", dropna=False, sort=False):
-        values = group[selected_name].dropna()
-        energy = group[energy_col].dropna()
-        if values.empty and energy.empty:
-            continue
-        # Robust per-device baseline: readings beyond Q3 + 1.5*IQR are flagged for review.
-        q1 = values.quantile(0.25) if len(values) >= 4 else None
-        q3 = values.quantile(0.75) if len(values) >= 4 else None
-        iqr = (q3 - q1) if q1 is not None and q3 is not None else None
-        threshold = (q3 + 1.5 * iqr) if iqr is not None and iqr > 0 else None
-        unusual = int((values > threshold).sum()) if threshold is not None else 0
-        rows.append({
-            "Appliance / meter": str(meter),
-            "Total energy (kWh)": float(energy.sum()) if not energy.empty else None,
-            "Mean reading": float(values.mean()) if not values.empty else None,
-            "Peak reading": float(values.max()) if not values.empty else None,
-            "Unusual high readings": unusual,
-            "Review threshold": float(threshold) if threshold is not None else None,
-            "Valid readings": int(values.size),
-        })
-    if not rows:
-        return None
-    result = pd.DataFrame(rows)
-    if "Total energy (kWh)" in result:
-        result = result.sort_values("Total energy (kWh)", ascending=False, na_position="last")
-    return result
-
-
-def render_appliance_insights(clean, rep, selected_name):
-    """Show device-level comparisons when the CSV contains an appliance/meter/zone identifier."""
-    st.markdown("### Appliance / meter-level insights")
-    if "meter" not in clean.columns or clean["meter"].nunique(dropna=True) < 2:
-        st.info("For appliance-level comparisons, map the optional meter/building/zone column to an appliance or device ID in your CSV. EnergyIQ cannot infer individual appliances from one aggregate building meter.")
-        return
-    table = appliance_breakdown(clean, rep, selected_name)
-    if table is None or table.empty:
-        st.info("Device-level energy totals are unavailable for this measurement type. Select an energy, cumulative-meter, or power measurement with a known unit.")
-        return
-    st.caption("Ranked by measured energy where available. 'Unusual high readings' use a per-device statistical threshold (Q3 + 1.5 × IQR); these are investigation flags, not proof of a fault.")
-    st.dataframe(table, use_container_width=True, hide_index=True)
-    energy_col = "Total energy (kWh)"
-    ranked = table.dropna(subset=[energy_col]) if energy_col in table else pd.DataFrame()
-    if not ranked.empty:
-        total = ranked[energy_col].sum()
-        top = ranked.iloc[0]
-        cols = st.columns(3)
-        cols[0].metric("Highest-use device", str(top["Appliance / meter"]))
-        cols[1].metric("Device energy", f"{top[energy_col]:,.2f} kWh")
-        share = 100 * top[energy_col] / total if total > 0 else None
-        cols[2].metric("Share of listed device energy", f"{share:.1f}%" if share is not None else "Unavailable")
-        st.markdown("**What to investigate first**")
-        flagged = table[table["Unusual high readings"] > 0]
-        if not flagged.empty:
-            st.write("Devices with unusual high readings: " + ", ".join(flagged["Appliance / meter"].astype(str).head(8).tolist()) + ". Compare the flagged timestamps with occupancy, operating schedules and equipment logs.")
-        else:
-            st.write("No device crossed the current per-device high-reading threshold. Compare the highest-use devices with their expected operating hours and rated power before deciding whether consumption is excessive.")
-
-
 def render_overview(result, ctx):
     clean, rep = result["clean"], result["report"]
     st.title("Energy overview")
@@ -2011,8 +2667,8 @@ def render_overview(result, ctx):
     a.metric("Timestamp coverage", f"{valid_share:.1f}%", help="Share of original rows whose timestamps could be parsed; blank timestamps are counted separately in data quality.")
     b.metric("Duplicate timestamps", f"{rep['n_dup']:,}")
     c.metric("Detected data gaps", f"{rep['n_gaps']:,}")
-    render_appliance_insights(clean, rep, name)
-    st.divider()
+    if isinstance(ctx, dict) and not ctx["item"]["error"]:
+        render_headline_insights(ctx["item"], ctx["res"], ctx["show_ml"])
     st.markdown("### What to explore next")
     cards = st.columns(3)
     cards[0].markdown("**Heatmap & Ghost Load**\n\nFind recurring high-use hours and compare usage against operating hours.")
@@ -2026,9 +2682,9 @@ def render_overview(result, ctx):
             st.info("The timeline will appear after the analysis completes.")
 
 
-def render_heatmap_page(item, res, kp):
+def render_heatmap_page(item, res, kp, show_ml=False):
     st.title("Heatmap & Ghost Load")
-    st.write("Explore average usage by weekday and hour, then compare readings against your operating schedule.")
+    st.write("Each cell is the average selected measurement for that weekday and hour across the uploaded period. Hotter cells mean higher typical readings, not automatically waste. Use the interpretation below to decide what to check next.")
     h = item["plot"]["heat"]
     if h is None:
         st.warning("There are not enough valid observations to build a heatmap.")
@@ -2045,50 +2701,59 @@ def render_heatmap_page(item, res, kp):
         top = valid.sort_values(ascending=False).head(5)
         for (day, hour), value in top.items():
             st.markdown(f"- **{DAY_NAMES[day]} at {hour:02d}:00** has an average of **{value:.4g} {res['info']['unit_out']}** across {int(h['n'].loc[day, hour])} valid observation(s).")
-        st.caption("These are the highest observed weekday-hour averages, not proof of waste. Check site schedules and whether continuous loads are necessary.")
+        peak_day, peak_hour = hi_idx
+        peak_value = float(valid.loc[hi_idx])
+        low_value = float(valid.loc[lo_idx])
+        spread = peak_value - low_value
+        relative = (peak_value / low_value - 1) * 100 if low_value > 0 else None
+        st.markdown("### What this pattern may mean")
+        st.write(f"The hottest cell is **{DAY_NAMES[peak_day]} at {peak_hour:02d}:00** ({peak_value:.4g} {res['info']['unit_out']}); "
+                 f"the lowest cell is **{DAY_NAMES[lo_idx[0]]} at {lo_idx[1]:02d}:00** ({low_value:.4g} {res['info']['unit_out']}). "
+                 + (f"The high cell is about **{relative:.1f}% higher** than the low cell." if relative is not None else
+                    f"The absolute difference is **{spread:.4g} {res['info']['unit_out']}**; a percentage comparison is not meaningful because the low cell is zero or negative.")
+                 + " This is a difference in typical readings, not automatically waste.")
+        st.markdown("**What to do next**")
+        st.markdown(f"- Compare {DAY_NAMES[peak_day]} at {peak_hour:02d}:00 with the same hour on other weeks.\n"
+                    "- If the period is expected to be active, check whether the high level is consistent with normal occupancy, weather or workload.\n"
+                    "- If the period is expected to be inactive, inspect scheduled HVAC, lighting, pumps, servers or other persistent loads; confirm site activity before changing settings.\n"
+                    "- Review the Peak & Anomaly page for individual dates in this cell. A heatmap average hides day-to-day spikes.")
+        st.caption("Possible causes are hypotheses to check, not diagnoses. A heatmap alone cannot identify which equipment caused a high reading.")
     if h["span_days"] < 14:
         st.warning(f"Only {h['span_days']} day(s) of data are available. Weekly patterns may not be representative.")
-    st.divider()
-    st.subheader("Operating schedule and off-hours usage")
-    sched, configured, errs = schedule_ui(kp)
-    if errs:
-        for e in errs: st.error(e)
-        return
-    oh = offhours_analysis(item["frame"], sched)
-    if oh is None:
-        st.info("No valid observations are available for this comparison.")
-        return
-    cols = st.columns(4)
-    cols[0].metric("In-hours readings", f"{oh['n_in']:,}")
-    cols[1].metric("Off-hours readings", f"{oh['n_off']:,}")
-    cols[2].metric("Mean off-hours usage", fmt(oh["mean_off"], res["info"]["unit_out"]))
-    cols[3].metric("Off-hours energy", f"{oh['energy_off']:,.2f} kWh" if oh["energy_off"] is not None else "Unavailable")
-    st.caption("The default schedule is a weekday 08:00–18:00 assumption until you confirm your own hours. Off-hours use may be legitimate.")
-    st.session_state["block3_offhours"] = {"available": True, "schedule_configured_by_user": configured,
-        "schedule_used": schedule_text(sched) + ("" if configured else " (presumed for exploration, not confirmed by the user)"),
-        "valid_in_schedule_points": oh["n_in"], "valid_off_hours_points": oh["n_off"], "days_with_off_hours_data": oh["off_days"],
-        "mean_off_hours_value": oh["mean_off"], "mean_in_schedule_value": oh["mean_in"],
-        "off_hours_mean_as_fraction_of_in_schedule_mean": (oh["mean_off"] / oh["mean_in"] if oh["mean_off"] is not None and oh["mean_in"] else None),
-        "off_hours_energy_kwh": oh["energy_off"], "off_hours_share_of_total_energy": oh["energy_share"],
-        "highest_off_hours_observations": [], "value_label": item["det"]["label"], "data_span_days": h["span_days"]}
+    render_offhours_insights(item, res, show_ml, kp)
+
+
+PAGES = ["Overview", "Heatmap & Ghost Load", "Peak & Anomaly Analysis", "Energy-Shifting Simulator",
+         "Green Sync", "Recommendations", "Data Quality"]
+
+
+def render_sidebar():
+    with st.sidebar:
+        st.markdown("## ⚡ EnergyIQ")
+        page = st.radio("Navigate", PAGES, key="nav_page", label_visibility="collapsed")
+        st.divider()
+    return page
 
 
 def render_peaks_page(item, res, show_ml, kp):
     st.title("Peak & Anomaly Analysis")
-    st.caption("Statistical peaks are high relative to this dataset. Model anomalies are unusual value/time patterns. Neither identifies a cause by itself.")
+    st.write("Peaks are the highest readings in your own data. Anomalies are readings that do not fit the usual pattern for their hour and weekday. "
+             "Both are prompts to investigate, not proof of waste or faults. The ranked event list shows which ones matter in energy and rupees.")
     render_series_result(item, res, show_ml)
-    st.plotly_chart(build_timeline(item, res, show_ml, True, True), use_container_width=True, key=kp("peaks_timeline"))
+    if item["error"]:
+        return
+    c1, c2 = st.columns(2)
+    sp = c1.checkbox("Highlight statistical peaks", True, key=kp("pk_peaks"))
+    sa = c2.checkbox("Show anomaly markers", True, key=kp("pk_anom"))
+    if item["plot"]["display"]["value"].notna().sum() == 0:
+        st.warning("There are no valid values to plot in this scope.")
+        return
+    st.plotly_chart(build_timeline(item, res, show_ml, sp, sa), use_container_width=True, key=kp("pk_fig"))
+    if show_ml and item.get("ml_msg"):
+        st.warning("Anomaly markers are not shown because the model was skipped: " + str(item["ml_msg"]))
+    render_event_insights(item, res, show_ml)
+    st.markdown("### All flagged readings")
     render_events(item, res, show_ml)
-
-
-def render_sidebar():
-    st.sidebar.markdown("# EnergyIQ")
-    st.sidebar.caption("Smart energy insights")
-    page = st.sidebar.radio("Navigate", ["Overview", "Heatmap & Ghost Load", "Peak & Anomaly Analysis", "Energy-Shifting Simulator", "Green Sync", "Recommendations", "Data Quality"], key="energyiq_page")
-    st.sidebar.divider()
-    st.sidebar.markdown("**Workflow**")
-    st.sidebar.caption("1. Upload\n\n2. Analyse\n\n3. Explore insights\n\n4. Test actions")
-    return page
 
 
 def main():
@@ -2107,6 +2772,28 @@ def main():
     div[data-testid="stFileUploader"] section { background:#F3EBDD; border:1px dashed #C8755D; border-radius:14px; }
     div[data-testid="stExpander"] { background:#F7F0E5; border:1px solid #E1D3C0; border-radius:12px; }
     div[data-baseweb="select"] > div, input, textarea { background:#FFFDF8 !important; }
+    /* Explicit light surfaces + dark text for every Streamlit input, including time_input. */
+    [data-testid="stTimeInput"] [data-baseweb="input"] > div,
+    [data-testid="stDateInput"] [data-baseweb="input"] > div,
+    [data-testid="stNumberInput"] [data-baseweb="input"] > div,
+    [data-testid="stTextInput"] [data-baseweb="input"] > div,
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+    [data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+        background:#FFFDF8 !important; border:1px solid #C9BBA8 !important;
+    }
+    [data-testid="stTimeInput"] input, [data-testid="stDateInput"] input,
+    [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input,
+    [data-testid="stSelectbox"] input, [data-testid="stMultiSelect"] input {
+        background:#FFFDF8 !important; color:#293743 !important;
+        -webkit-text-fill-color:#293743 !important; caret-color:#293743 !important;
+    }
+    [data-testid="stTimeInput"] button, [data-testid="stDateInput"] button,
+    [data-baseweb="select"] svg, [data-baseweb="input"] svg { color:#293743 !important; fill:#293743 !important; }
+    [data-baseweb="popover"], [data-baseweb="menu"], ul[role="listbox"] {
+        background:#FFFDF8 !important; color:#293743 !important;
+    }
+    [role="option"] { background:#FFFDF8 !important; color:#293743 !important; }
+    [role="option"]:hover { background:#E8DCC8 !important; color:#293743 !important; }
     /* Keep all selectable/input text readable on the light input surfaces. */
     div[data-baseweb="select"] *,
     div[data-baseweb="input"] *,
@@ -2263,7 +2950,7 @@ def main():
         return
     labels = [("dataset" if it["meter"] is None else str(it["meter"])) for it in res["series"]]
     if len(labels) > 1:
-        chosen_scope = st.sidebar.selectbox("Meter / zone", labels, key=f"scope_{sig}")
+        chosen_scope = st.sidebar.selectbox("Meter / zone", labels, key=f"scope_{st.session_state.get('cfg_sig', '')[:10]}")
         idx = labels.index(chosen_scope)
     else:
         idx = 0
@@ -2275,17 +2962,21 @@ def main():
     if page == "Overview":
         render_overview(result, ctx)
     elif page == "Heatmap & Ghost Load":
-        render_heatmap_page(item, res, kp)
+        render_heatmap_page(item, res, kp, show_ml)
     elif page == "Peak & Anomaly Analysis":
         render_peaks_page(item, res, show_ml, kp)
     elif page == "Energy-Shifting Simulator":
         st.title("Energy-Shifting Simulator")
         render_simulator(item, res, kp, include_green_sync=False)
+        if isinstance(ctx, dict):
+            render_shift_recommendation(item, res, show_ml, kp)
     elif page == "Green Sync":
         st.title("Green Sync")
         summary = st.session_state.get("block4_summary", {})
         total_kwh = summary.get("total_energy_simulated_kwh") if summary.get("available") else get_energy_total(clean, rep, res["name"])
         render_green_sync(kp, total_kwh)
+        if isinstance(ctx, dict):
+            render_solar_alignment(item, res, show_ml, kp)
     elif page == "Recommendations":
         render_report_section(result, ctx)
     elif page == "Data Quality":
